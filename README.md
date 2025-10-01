@@ -18,7 +18,7 @@ extism call target/wasm32-unknown-unknown/debug/rust_pdk_template.wasm greet --i
 Get-Content -Raw -Path .\processinput.json | extism call target\wasm32-unknown-unknown\debug\redseat_plugin_torbox.wasm --allow-host '*' --log-level=info --wasi process --stdin
 
 Get-Content -Raw -Path .\lookupinput.json | extism call target\wasm32-unknown-unknown\debug\redseat_plugin_torbox.wasm --allow-host '*' --log-level=info --wasi lookup --stdin
-
+cat ./lookupinput.json | extism call ./target/wasm32-unknown-unknown/debug/redseat_plugin_torbox.wasm --allow-host '*' --log-level=info --wasi lookup --stdin
 ## Exemple input
 ### Process
 ```json
