@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use extism_pdk::*;
-use rs_plugin_common_interfaces::{CredentialType, PluginInformation, PluginType, RsAudio, RsLookupQuery, RsLookupSourceResult, RsLookupWrapper, RsRequest, RsRequestFiles, RsRequestPluginRequest, RsRequestStatus, RsVideoCodec};
+use rs_plugin_common_interfaces::{CredentialType, PluginInformation, PluginType, RsAudio, RsLookupQuery, RsLookupSourceResult, RsLookupWrapper, RsRequest, RsRequestFiles, RsRequestPluginRequest, RsRequestStatus, RsResolution, RsVideoCodec};
 use serde::{Deserialize, Serialize, Deserializer};
 use urlencoding::encode;
 
@@ -225,7 +225,11 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
             let mut r = RsRequest {
                 url: magnet,
                 permanent: true,
-                filename: Some(t.title),
+                filename: Some(t.raw_title.clone()),
+                language: t.title_parsed_data.language.as_ref().and_then(|l| match l {
+                    StringOrArray::Single(s) => Some(s.clone()),
+                    StringOrArray::Array(vs) => Some(vs.join(", ")),
+                }),
                 season: t.title_parsed_data.season.as_ref().and_then(|s| match s {
                     U32OrArray::Single(v) => Some(*v),
                     U32OrArray::Array(vs) => vs.first().cloned(),
@@ -242,6 +246,10 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
                     RsAudio::Unknown => RsAudio::Custom(a.clone()),
                     other => other,
                 }).map(|a| vec![a]),
+                resolution: t.title_parsed_data.resolution.as_ref().map(|a| match RsResolution::from_filename(a) {
+                    RsResolution::Unknown => RsResolution::Custom(a.clone()),
+                    other => other,
+                }),
                 size: Some(t.size),
                 ..Default::default()
             };
