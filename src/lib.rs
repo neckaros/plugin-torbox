@@ -120,7 +120,7 @@ struct Torrent {
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(
-        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 1, publisher: "neckaros".into(), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
+        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 1, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
     ))
 }
 
