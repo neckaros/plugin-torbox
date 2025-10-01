@@ -480,7 +480,7 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
 
     if create_res.status_code() != 200 {
         let error_msg = String::from_utf8_lossy(&create_res.body()).to_string();
-        return Err(WithReturnCode(extism_pdk::Error::msg(format!("Create torrent HTTP {}: {}", create_res.status_code(), error_msg)), create_res.status_code() as i32));
+        return Err(WithReturnCode(extism_pdk::Error::msg(format!("Create torrent HTTP {}: {}\nBody:\n {}", create_res.status_code(), error_msg, String::from_utf8(create_res.body()).unwrap_or("no body".to_string()))), create_res.status_code() as i32));
     }
 
     let create_response: CreateTorrentResponse = create_res.json()
