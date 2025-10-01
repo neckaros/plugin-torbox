@@ -261,8 +261,8 @@ fn get_search_query_and_params(query: &RsLookupQuery) -> (String, Option<(u32, O
     match query {
         RsLookupQuery::Movie(m) => {
             if let Some(ids) = &m.ids {
-                if let Some(id_str) = ids.tmdb.map(|u| format!("tmdb:{}", u))
-                    .or(ids.imdb.as_ref().map(|s| format!("imdb:{}", s)))
+                if let Some(id_str) = ids.imdb.as_ref().map(|u| format!("imdb:{}", u))
+                    .or(ids.tmdb.map(|s| format!("tmdb:{}", s)))
                     .or(ids.tvdb.map(|u| format!("tvdb:{}", u))) {
                     return (id_str, None);
                 }
@@ -273,8 +273,8 @@ fn get_search_query_and_params(query: &RsLookupQuery) -> (String, Option<(u32, O
             let ep_num = e.number.unwrap_or(1);
             let base_query = format!("{} S{:02}E{:02}", e.serie, e.season, ep_num);
             if let Some(ids) = &e.ids {
-                if let Some(id_str) = ids.tmdb.map(|u| format!("tmdb:{}", u))
-                    .or(ids.imdb.as_ref().map(|s| format!("imdb:{}", s)))
+                if let Some(id_str) = ids.imdb.as_ref().map(|u| format!("imdb:{}", u))
+                    .or(ids.tmdb.map(|s| format!("tmdb:{}", s)))
                     .or(ids.tvdb.map(|u| format!("tvdb:{}", u))) {
                     return (id_str, Some((e.season, Some(ep_num))));
                 }
@@ -283,8 +283,8 @@ fn get_search_query_and_params(query: &RsLookupQuery) -> (String, Option<(u32, O
         },
         RsLookupQuery::SerieSeason(s) => {
             if let Some(ids) = &s.ids {
-                if let Some(id_str) = ids.tmdb.map(|u| format!("tmdb:{}", u))
-                    .or(ids.imdb.as_ref().map(|s| format!("imdb:{}", s)))
+                if let Some(id_str) = ids.imdb.as_ref().map(|u| format!("imdb:{}", u))
+                    .or(ids.tmdb.map(|s| format!("tmdb:{}", s)))
                     .or(ids.tvdb.map(|u| format!("tvdb:{}", u))) {
                     return (id_str, Some((s.name.parse().unwrap_or(1), None))); // Assume season from name or default
                 }
