@@ -160,10 +160,17 @@ pub fn request_permanent(Json(mut request): Json<RsRequestPluginRequest>) -> FnR
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
         let torrent_info = check_instant(&request.request, token)?
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not available for instant download"), 404))?;
+        if torrent_info.files.len() > 1 && request.request.selected_file.is_none() {
+            let mut result = request.request.clone();
+            result.status = RsRequestStatus::NeedFileSelection;
+            result.permanent = false;
+            result.files = Some(torrent_info.files.into_iter().map(|l| RsRequestFiles { name: l.name, size: l.size, mime: Some(l.mimetype), ..Default::default()}).collect());
+            return Ok(Json(result));
+        }
         let url = get_file_download_url(&request.request, &torrent_info, token, true)?;
         let mut final_request = request.request.clone();
         final_request.url = url;
-        final_request.status = RsRequestStatus::Unprocessed;
+        final_request.status = RsRequestStatus::FinalPrivate;
         final_request.permanent = true;
         final_request.mime = Some("applications/torbox".to_owned());
         Ok(Json(final_request))
