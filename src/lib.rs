@@ -164,7 +164,11 @@ pub fn request_permanent(Json(mut request): Json<RsRequestPluginRequest>) -> FnR
             let mut result = request.request.clone();
             result.status = RsRequestStatus::NeedFileSelection;
             result.permanent = false;
-            result.files = Some(torrent_info.files.into_iter().map(|l| RsRequestFiles { name: l.name, size: l.size, mime: Some(l.mimetype), ..Default::default()}).collect());
+            result.files = Some(torrent_info.files.into_iter().map(|l| {
+                let mut file = RsRequestFiles { name: l.name, size: l.size, mime: Some(l.mimetype), ..Default::default()};
+                file.parse_filename();
+                file
+            }).collect());
             return Ok(Json(result));
         }
         let url = get_file_download_url(&request.request, &torrent_info, token, true)?;
@@ -339,7 +343,11 @@ fn handle_magnet_request(request: &RsRequest, password: &str) -> FnResult<Json<R
             if torrent_info.files.len() > 1 && request.selected_file.is_none() {
                 let mut result = request.clone();
                 result.status = RsRequestStatus::NeedFileSelection;
-                result.files = Some(torrent_info.files.into_iter().map(|l| RsRequestFiles { name: l.name, size: l.size, mime: Some(l.mimetype), ..Default::default()}).collect());
+                result.files = Some(torrent_info.files.into_iter().map(|l| {
+                let mut file = RsRequestFiles { name: l.name, size: l.size, mime: Some(l.mimetype), ..Default::default()};
+                    file.parse_filename();
+                    file
+                }).collect());
                 result.parse_subfilenames();
                 Ok(Json(result))
             } else {
