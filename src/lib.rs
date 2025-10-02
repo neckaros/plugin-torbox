@@ -139,6 +139,14 @@ pub fn process(Json(request): Json<RsRequestPluginRequest>) -> FnResult<Json<RsR
             return Err(WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401));
         }
 
+    } else if request.request.url.starts_with("torbox://") {
+        let token = &request.credential.and_then(|c| c.password)
+            .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
+        let mut new_request = request.request.clone();
+        new_request.url = new_request.url.replacen("torbox://", "https://", 1).replace("_TOKEN_", token);
+        new_request.status = RsRequestStatus::FinalPrivate; // Direct download link
+        new_request.permanent = false;      
+        return Ok(Json(new_request));
     }
 
     Err(WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404))
@@ -148,11 +156,25 @@ pub fn process(Json(request): Json<RsRequestPluginRequest>) -> FnResult<Json<RsR
 #[plugin_fn]
 pub fn request_permanent(Json(mut request): Json<RsRequestPluginRequest>) -> FnResult<Json<RsRequest>> {
     if request.request.url.starts_with("magnet") {
+        let token = &request.credential.and_then(|c| c.password)
+            .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
+        let torrent_info = check_instant(&request.request, token)?
+            .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not available for instant download"), 404))?;
+        let url = get_file_download_url(&request.request, &torrent_info, token, true)?;
         let mut final_request = request.request.clone();
+        final_request.url = url;
         final_request.status = RsRequestStatus::Unprocessed;
         final_request.permanent = true;
-        final_request.mime = Some("applications/x-bittorrent".to_owned());
+        final_request.mime = Some("applications/torbox".to_owned());
         Ok(Json(final_request))
+    } else if request.request.url.starts_with("https://api.torbox.app/v1/api/torrents/requestdl") {
+        let token = &request.credential.and_then(|c| c.password)
+            .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
+        let mut new_request = request.request.clone();
+        new_request.url = request.request.url.replacen("https://", "torbox://", 1).replace(token, "_TOKEN_");
+        new_request.status = RsRequestStatus::FinalPrivate; // Direct download link
+        new_request.permanent = true;      
+        return Ok(Json(new_request));
     } else {
         Err(WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404))
     }
@@ -224,7 +246,7 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
 
             let mut r = RsRequest {
                 url: magnet,
-                permanent: true,
+                permanent: false,
                 filename: Some(t.raw_title.clone()),
                 language: t.title_parsed_data.language.as_ref().and_then(|l| match l {
                     StringOrArray::Single(s) => Some(s.clone()),
@@ -315,7 +337,8 @@ fn handle_magnet_request(request: &RsRequest, password: &str) -> FnResult<Json<R
                 Ok(Json(result))
             } else {
                 // instant available, get file download URL
-                let download_url = get_file_download_url(request, &torrent_info, password)?;
+                let download_url = get_file_download_url(request, &torrent_info, password, true)?.replace("torbox://", "https://").replace("_TOKEN_", password);
+
                 let mut new_request = request.clone();
                 new_request.status = RsRequestStatus::FinalPrivate;
                 new_request.url = download_url;
@@ -433,7 +456,7 @@ fn check_instant(request: &RsRequest, token: &str) -> FnResult<Option<TorrentInf
     })
 }
 
-fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token: &str) -> FnResult<String> {
+fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token: &str, permanent: bool) -> FnResult<String> {
     let raw_hash = extract_btih_hash(&request.url)
         .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("Invalid magnet link: no BTIH hash found"), 400))?;
     let canonical_hash = get_canonical_hash(&raw_hash)?;
@@ -500,6 +523,10 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
 
     let torrent_id = create_response.data.torrent_id;
 
+    if permanent {
+        // For permanent requests, we are done here
+        return Ok(format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", torrent_id, file_id));
+    }
     // Request download link
     let dl_req = HttpRequest {
         url: format!("https://api.torbox.app/v1/api/torrents/requestdl?token={}&redirect=false&torrent_id={}&file_id={}", token, torrent_id, file_id),
