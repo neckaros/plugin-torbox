@@ -22,6 +22,7 @@ struct TorrentInfo {
     files: Vec<FileInfo>,
 }
 
+
 #[derive(Deserialize, Debug, Clone)]
 struct FileInfo {
     name: String,
@@ -30,6 +31,73 @@ struct FileInfo {
     short_name: String,
     mimetype: String,
 }
+
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MyTorrentsResponse {
+    pub success: bool,
+    pub error: Option<String>,
+    pub detail: String,
+    pub data: Vec<MyTorrent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MyTorrent {
+    pub id: i64,
+    pub auth_id: String,
+    pub server: i64,
+    pub hash: String,
+    pub name: String,
+    pub magnet: Option<String>,
+    pub size: u64,
+    pub active: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    pub download_state: String,
+    pub seeds: i64,
+    pub peers: i64,
+    pub ratio: f64,
+    pub progress: f64,
+    pub download_speed: i64,
+    pub upload_speed: i64,
+    pub eta: i64,
+    pub torrent_file: bool,
+    pub expires_at: Option<String>,
+    pub download_present: bool,
+    pub files: Vec<MyFile>,
+    pub download_path: String,
+    pub availability: i64,
+    pub download_finished: bool,
+    pub tracker: Option<String>,
+    pub total_uploaded: i64,
+    pub total_downloaded: i64,
+    pub cached: bool,
+    pub owner: String,
+    pub seed_torrent: bool,
+    pub allow_zipped: bool,
+    pub long_term_seeding: bool,
+    pub tracker_message: Option<String>,
+    pub cached_at: String,
+    pub private: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MyFile {
+    pub id: i64,
+    pub md5: Option<String>,
+    pub hash: String,
+    pub name: String,
+    pub size: u64,
+    pub zipped: bool,
+    pub s3_path: String,
+    pub infected: bool,
+    pub mimetype: String,
+    pub short_name: String,
+    pub absolute_path: String,
+    pub opensubtitles_hash: Option<String>,
+}
+
+
 
 #[derive(Serialize)]
 struct CreateBody {
@@ -158,6 +226,7 @@ pub fn request_permanent(Json(mut request): Json<RsRequestPluginRequest>) -> FnR
     if request.request.url.starts_with("magnet") {
         let token = &request.credential.and_then(|c| c.password)
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
+
         let torrent_info = check_instant(&request.request, token)?
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not available for instant download"), 404))?;
         if torrent_info.files.len() > 1 && request.request.selected_file.is_none() {
@@ -165,12 +234,34 @@ pub fn request_permanent(Json(mut request): Json<RsRequestPluginRequest>) -> FnR
             result.status = RsRequestStatus::NeedFileSelection;
             result.permanent = false;
             result.files = Some(torrent_info.files.into_iter().map(|l| {
-                let mut file = RsRequestFiles { name: l.name, size: l.size, mime: Some(l.mimetype), ..Default::default()};
+                let mut file = RsRequestFiles { name: l.short_name, size: l.size, mime: Some(l.mimetype), ..Default::default()};
                 file.parse_filename();
                 file
             }).collect());
             return Ok(Json(result));
         }
+
+        // Check if already downloaded and cached
+        let raw_hash = extract_btih_hash(&request.request.url)
+            .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("Invalid magnet link: no BTIH hash found"), 400))?;
+        let canonical_hash = get_canonical_hash(&raw_hash)?;
+        let existing = get_my_torrents(token, 20)?.iter().find(|t| t.hash.eq_ignore_ascii_case(&canonical_hash)).cloned();
+        if let Some(t) = existing {
+            if t.cached {
+                if let Some(file) = t.files.iter().find(|f| { f.short_name == request.request.selected_file.clone().unwrap_or_default() || f.name == request.request.selected_file.clone().unwrap_or_default() }) {
+                    log!(LogLevel::Info, "File already cached: {}", file.name);
+                    // Already cached, return direct download link
+                    let mut new_request = request.request.clone();
+                    new_request.url = format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", t.id, file.id);
+                    new_request.url = new_request.url.replacen("torbox://", "https://", 1).replace("_TOKEN_", token);
+                    new_request.status = RsRequestStatus::FinalPrivate; // Direct download link
+                    new_request.permanent = true;      
+                    return Ok(Json(new_request));
+                }
+            }
+        }
+
+
         let url = get_file_download_url(&request.request, &torrent_info, token, true)?;
         let mut final_request = request.request.clone();
         final_request.url = url;
@@ -344,7 +435,7 @@ fn handle_magnet_request(request: &RsRequest, password: &str) -> FnResult<Json<R
                 let mut result = request.clone();
                 result.status = RsRequestStatus::NeedFileSelection;
                 result.files = Some(torrent_info.files.into_iter().map(|l| {
-                let mut file = RsRequestFiles { name: l.name, size: l.size, mime: Some(l.mimetype), ..Default::default()};
+                let mut file = RsRequestFiles { name: l.short_name, size: l.size, mime: Some(l.mimetype), ..Default::default()};
                     file.parse_filename();
                     file
                 }).collect());
@@ -469,6 +560,30 @@ fn check_instant(request: &RsRequest, token: &str) -> FnResult<Option<TorrentInf
     } else {
         None
     })
+}
+
+
+fn get_my_torrents(token: &str, limit: i32) -> FnResult<Vec<MyTorrent>> {
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+
+    let req = HttpRequest {
+        url: format!("https://api.torbox.app/v1/api/torrents/mylist?limit={}", limit),
+        headers,
+        method: Some("GET".into()),
+    };
+
+    let res = http::request::<()>(&req, None)?;
+
+    if res.status_code() != 200 {
+        let error_msg = String::from_utf8_lossy(&res.body()).to_string();
+        return Err(WithReturnCode(extism_pdk::Error::msg(format!("HTTP error getting my torrent list {}: {}", res.status_code(), error_msg)), res.status_code() as i32));
+    }
+
+    let response: MyTorrentsResponse = res.json()
+        .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON check instant result parse error: {}\nBody:\n {}", e, String::from_utf8(res.body()).unwrap_or("no body".to_string()))), 500))?;
+
+   Ok(response.data)
 }
 
 fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token: &str, permanent: bool) -> FnResult<String> {
