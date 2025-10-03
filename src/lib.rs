@@ -229,6 +229,8 @@ pub fn request_permanent(Json(mut request): Json<RsRequestPluginRequest>) -> FnR
 
         let torrent_info = check_instant(&request.request, token)?
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not available for instant download"), 404))?;
+
+        log!(LogLevel::Debug, "Torrent Info {:?}\n\n", torrent_info );
         if torrent_info.files.len() > 1 && request.request.selected_file.is_none() {
             let mut result = request.request.clone();
             result.status = RsRequestStatus::NeedFileSelection;
@@ -245,7 +247,11 @@ pub fn request_permanent(Json(mut request): Json<RsRequestPluginRequest>) -> FnR
         let raw_hash = extract_btih_hash(&request.request.url)
             .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("Invalid magnet link: no BTIH hash found"), 400))?;
         let canonical_hash = get_canonical_hash(&raw_hash)?;
+        log!(LogLevel::Info, "looking for existing hash {:?}\n", canonical_hash );
         let existing = get_my_torrents(token, 20)?.iter().find(|t| t.hash.eq_ignore_ascii_case(&canonical_hash)).cloned();
+
+        log!(LogLevel::Debug, "In {:?}\n\n", existing );
+
         if let Some(t) = existing {
             if t.cached {
                 if let Some(file) = t.files.iter().find(|f| { f.short_name == request.request.selected_file.clone().unwrap_or_default() || f.name == request.request.selected_file.clone().unwrap_or_default() }) {
@@ -261,6 +267,7 @@ pub fn request_permanent(Json(mut request): Json<RsRequestPluginRequest>) -> FnR
         }
 
 
+        log!(LogLevel::Info, "Getting file download link by adding it to your torrents {:?}\n", canonical_hash );
         let url = get_file_download_url(&request.request, &torrent_info, token, true)?;
         let mut final_request = request.request.clone();
         final_request.url = url;
