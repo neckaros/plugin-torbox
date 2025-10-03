@@ -253,7 +253,6 @@ pub fn request_permanent(Json(mut request): Json<RsRequestPluginRequest>) -> FnR
                     // Already cached, return direct download link
                     let mut new_request = request.request.clone();
                     new_request.url = format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", t.id, file.id);
-                    new_request.url = new_request.url.replacen("torbox://", "https://", 1).replace("_TOKEN_", token);
                     new_request.status = RsRequestStatus::FinalPrivate; // Direct download link
                     new_request.permanent = true;      
                     return Ok(Json(new_request));
