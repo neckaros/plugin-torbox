@@ -42,6 +42,15 @@ pub struct MyTorrentsResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct MyTorrentResponse {
+    pub success: bool,
+    pub error: Option<String>,
+    pub detail: String,
+    pub data: MyTorrent,
+}
+
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct MyTorrent {
     pub id: i64,
     pub auth_id: String,
@@ -592,6 +601,29 @@ fn get_my_torrents(token: &str, limit: i32) -> FnResult<Vec<MyTorrent>> {
    Ok(response.data)
 }
 
+fn get_my_torrent(token: &str, id: i32) -> FnResult<MyTorrent> {
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+
+    let req = HttpRequest {
+        url: format!("https://api.torbox.app/v1/api/torrents/mylist?id={}", id),
+        headers,
+        method: Some("GET".into()),
+    };
+
+    let res = http::request::<()>(&req, None)?;
+
+    if res.status_code() != 200 {
+        let error_msg = String::from_utf8_lossy(&res.body()).to_string();
+        return Err(WithReturnCode(extism_pdk::Error::msg(format!("HTTP error getting my torrent by id({}) {}: {}", id, res.status_code(), error_msg)), res.status_code() as i32));
+    }
+
+    let response: MyTorrentResponse = res.json()
+        .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON get one of my torrent by id({}) parse error: {}\nBody:\n {}", id, e, String::from_utf8(res.body()).unwrap_or("no body".to_string()))), 500))?;
+
+   Ok(response.data)
+}
+
 fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token: &str, permanent: bool) -> FnResult<String> {
     let raw_hash = extract_btih_hash(&request.url)
         .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("Invalid magnet link: no BTIH hash found"), 400))?;
@@ -604,27 +636,6 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
     if files.is_empty() {
         return Err(WithReturnCode(extism_pdk::Error::msg("No files found in torrent"), 404));
     }
-
-    // Select file index (0-based)
-    let file_index: usize = if let Some(sel) = &request.selected_file {
-        if let Ok(fid) = sel.parse::<usize>() {
-            if fid == 0 || fid > files.len() {
-                return Err(WithReturnCode(extism_pdk::Error::msg("Invalid file ID"), 400));
-            }
-            fid - 1
-        } else {
-            files.iter().position(|f| f.short_name == *sel || f.name == *sel)
-                .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("Selected file not found"), 404))?
-        }
-    } else {
-        files.iter()
-            .enumerate()
-            .max_by_key(|(_, f)| f.size)
-            .map(|(i, _)| i)
-            .unwrap_or(0)
-    };
-
-    let file_id = (file_index) as i32;
 
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     headers.insert("Authorization".to_string(), format!("Bearer {}", token));
@@ -658,6 +669,12 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
     }
 
     let torrent_id = create_response.data.torrent_id;
+
+
+
+    let my_torrent = get_my_torrent(token, torrent_id)?;
+    let file = my_torrent.files.iter().find(|f| { f.short_name == request.selected_file.clone().unwrap_or_default() || f.name == request.selected_file.clone().unwrap_or_default() }).ok_or(extism_pdk::Error::msg(format!("Add torrent - Unable to find file({:?}) in {:?}", request.selected_file, my_torrent.files)))?;
+    let file_id = file.id;
 
     if permanent {
         // For permanent requests, we are done here
