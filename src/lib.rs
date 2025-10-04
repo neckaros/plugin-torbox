@@ -257,7 +257,10 @@ pub fn request_permanent(Json(mut request): Json<RsRequestPluginRequest>) -> FnR
             .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("Invalid magnet link: no BTIH hash found"), 400))?;
         let canonical_hash = get_canonical_hash(&raw_hash)?;
         log!(LogLevel::Info, "looking for existing hash {:?}\n", canonical_hash );
-        let existing = get_my_torrents(token, 20)?.iter().find(|t| t.hash.eq_ignore_ascii_case(&canonical_hash)).cloned();
+        let existing = match search_my_torrents(token, &canonical_hash, 20, None)? {
+            Some(value) => Some(value),
+            None => search_my_torrents(token, &canonical_hash, 20, Some(true))?,
+        };
 
         log!(LogLevel::Debug, "In {:?}\n\n", existing );
 
@@ -578,12 +581,12 @@ fn check_instant(request: &RsRequest, token: &str) -> FnResult<Option<TorrentInf
 }
 
 
-fn get_my_torrents(token: &str, limit: i32) -> FnResult<Vec<MyTorrent>> {
+fn get_my_torrents(token: &str, limit: i32, bypass_cache: Option<bool>) -> FnResult<Vec<MyTorrent>> {
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     headers.insert("Authorization".to_string(), format!("Bearer {}", token));
 
     let req = HttpRequest {
-        url: format!("https://api.torbox.app/v1/api/torrents/mylist?limit={}", limit),
+        url: format!("https://api.torbox.app/v1/api/torrents/mylist?limit={}&bypass_cache={}", limit, bypass_cache.unwrap_or_default()),
         headers,
         method: Some("GET".into()),
     };
@@ -601,12 +604,16 @@ fn get_my_torrents(token: &str, limit: i32) -> FnResult<Vec<MyTorrent>> {
    Ok(response.data)
 }
 
+fn search_my_torrents(token: &str, canonical_hash: &str, limit: i32, bypass_cache: Option<bool>) -> FnResult<Option<MyTorrent>> {
+    Ok(get_my_torrents(token, limit, bypass_cache)?.iter().find(|t| t.hash.eq_ignore_ascii_case(&canonical_hash)).cloned())
+}
+
 fn get_my_torrent(token: &str, id: i32) -> FnResult<MyTorrent> {
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     headers.insert("Authorization".to_string(), format!("Bearer {}", token));
 
     let req = HttpRequest {
-        url: format!("https://api.torbox.app/v1/api/torrents/mylist?id={}", id),
+        url: format!("https://api.torbox.app/v1/api/torrents/mylist?id={}&bypass_cache=true", id),
         headers,
         method: Some("GET".into()),
     };
