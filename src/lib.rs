@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use extism_pdk::*;
 use rs_plugin_common_interfaces::{CredentialType, PluginInformation, PluginType, RsAudio, RsLookupQuery, RsLookupSourceResult, RsLookupWrapper, RsRequest, RsRequestFiles, RsRequestPluginRequest, RsRequestStatus, RsResolution, RsVideoCodec};
-use serde::{Deserialize, Serialize, Deserializer};
+use serde::Deserialize;
 use urlencoding::encode;
 
 
@@ -10,24 +10,24 @@ use urlencoding::encode;
 struct ApiResponse {
     success: bool,
     error: Option<String>,
-    detail: String,
+    //detail: String,
     data: HashMap<String, TorrentInfo>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 struct TorrentInfo {
-    name: String,
-    size: u64,
-    hash: String,
+    //name: String,
+    //size: u64,
+    //hash: String,
     files: Vec<FileInfo>,
 }
 
 
 #[derive(Deserialize, Debug, Clone)]
 struct FileInfo {
-    name: String,
+    //name: String,
     size: u64,
-    opensubtitles_hash: Option<String>,
+    //opensubtitles_hash: Option<String>,
     short_name: String,
     mimetype: String,
 }
@@ -58,36 +58,36 @@ pub struct MyTorrent {
     pub hash: String,
     pub name: String,
     pub magnet: Option<String>,
-    pub size: u64,
-    pub active: bool,
-    pub created_at: String,
-    pub updated_at: String,
-    pub download_state: String,
-    pub seeds: i64,
-    pub peers: i64,
-    pub ratio: f64,
-    pub progress: f64,
-    pub download_speed: i64,
-    pub upload_speed: i64,
-    pub eta: i64,
-    pub torrent_file: bool,
-    pub expires_at: Option<String>,
-    pub download_present: bool,
+    // pub size: u64,
+    // pub active: bool,
+    // pub created_at: String,
+    // pub updated_at: String,
+    // pub download_state: String,
+    // pub seeds: i64,
+    // pub peers: i64,
+    // pub ratio: f64,
+    // pub progress: f64,
+    // pub download_speed: i64,
+    // pub upload_speed: i64,
+    // pub eta: i64,
+    // pub torrent_file: bool,
+    // pub expires_at: Option<String>,
+    // pub download_present: bool,
     pub files: Vec<MyFile>,
-    pub download_path: String,
-    pub availability: i64,
-    pub download_finished: bool,
-    pub tracker: Option<String>,
-    pub total_uploaded: i64,
-    pub total_downloaded: i64,
+    // pub download_path: String,
+    // pub availability: i64,
+    // pub download_finished: bool,
+    // pub tracker: Option<String>,
+    // pub total_uploaded: i64,
+    // pub total_downloaded: i64,
     pub cached: bool,
-    pub owner: String,
-    pub seed_torrent: bool,
-    pub allow_zipped: bool,
-    pub long_term_seeding: bool,
-    pub tracker_message: Option<String>,
-    pub cached_at: String,
-    pub private: bool,
+    // pub owner: String,
+    // pub seed_torrent: bool,
+    // pub allow_zipped: bool,
+    // pub long_term_seeding: bool,
+    // pub tracker_message: Option<String>,
+    // pub cached_at: String,
+    // pub private: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,17 +107,17 @@ pub struct MyFile {
 }
 
 
-
+/*
 #[derive(Serialize)]
 struct CreateBody {
     magnet: String,
-}
+} */
 
 #[derive(Deserialize)]
 struct CreateTorrentResponse {
-    success: bool,
+    //success: bool,
     error: Option<String>,
-    detail: String,
+    //detail: String,
     data: CreateData,
 }
 
@@ -128,9 +128,9 @@ struct CreateData {
 
 #[derive(Deserialize)]
 struct DownloadLinkResponse {
-    success: bool,
+    //success: bool,
     error: Option<String>,
-    detail: String,
+    //detail: String,
     data: String,
 }
 
@@ -167,9 +167,9 @@ struct TitleParsedData {
     codec: Option<String>,
     audio: Option<String>,
     language: Option<StringOrArray>,
-    title: Option<String>,
-    excess: Option<StringOrArray>,
-    encoder: Option<String>,
+    //title: Option<String>,
+    //excess: Option<StringOrArray>,
+    //encoder: Option<String>,
 }
 #[derive(Deserialize, Debug)]
 struct Torrent {
@@ -178,18 +178,18 @@ struct Torrent {
     title: String,
     title_parsed_data: TitleParsedData,
     magnet: Option<String>,
-    torrent: Option<String>,
-    last_known_seeders: u32,
-    last_known_peers: u32,
+    //torrent: Option<String>,
+    //last_known_seeders: u32,
+    //last_known_peers: u32,
     size: u64,
-    tracker: String,
-    categories: Vec<String>,
-    files: u32,
-    #[serde(rename = "type")]
-    kind: String,
-    nzb: Option<String>,
-    age: String,
-    user_search: bool,
+    //tracker: String,
+    //categories: Vec<String>,
+    //files: u32,
+    //#[serde(rename = "type")]
+    //kind: String,
+    //nzb: Option<String>,
+    //age: String,
+    //user_search: bool,
     cached: bool,
 }
 
@@ -231,7 +231,7 @@ pub fn process(Json(request): Json<RsRequestPluginRequest>) -> FnResult<Json<RsR
 
 
 #[plugin_fn]
-pub fn request_permanent(Json(mut request): Json<RsRequestPluginRequest>) -> FnResult<Json<RsRequest>> {
+pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResult<Json<RsRequest>> {
     if request.request.url.starts_with("magnet") {
         let token = &request.credential.and_then(|c| c.password)
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
@@ -361,13 +361,13 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
                 format!("magnet:?xt=urn:btih:{}&dn={}", t.hash, encode(&t.title))
             });
 
-            let mut r = RsRequest {
+            let r = RsRequest {
                 url: magnet,
                 permanent: false,
                 filename: Some(t.raw_title.clone()),
-                language: t.title_parsed_data.language.as_ref().and_then(|l| match l {
-                    StringOrArray::Single(s) => Some(s.clone()),
-                    StringOrArray::Array(vs) => Some(vs.join(", ")),
+                language: t.title_parsed_data.language.as_ref().map(|l| match l {
+                    StringOrArray::Single(s) => s.clone(),
+                    StringOrArray::Array(vs) => vs.join(", "),
                 }),
                 season: t.title_parsed_data.season.as_ref().and_then(|s| match s {
                     U32OrArray::Single(v) => Some(*v),
@@ -625,11 +625,6 @@ fn get_my_torrent(token: &str, id: i32) -> FnResult<MyTorrent> {
 }
 
 fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token: &str, permanent: bool) -> FnResult<String> {
-    let raw_hash = extract_btih_hash(&request.url)
-        .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("Invalid magnet link: no BTIH hash found"), 400))?;
-    let canonical_hash = get_canonical_hash(&raw_hash)?;
-
-    let encoded_hash = encode(&canonical_hash);
 
     let files = &torrent_info.files;
 
