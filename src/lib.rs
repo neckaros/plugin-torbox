@@ -221,7 +221,7 @@ pub fn process(Json(request): Json<RsRequestPluginRequest>) -> FnResult<Json<RsR
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
         let mut new_request = request.request.clone();
         new_request.url = new_request.url.replacen("torbox://", "https://", 1).replace("_TOKEN_", token);
-        new_request.status = RsRequestStatus::FinalPrivate; // Direct download link
+        new_request.status = RsRequestStatus::FinalPublic; // Direct download link
         new_request.permanent = false;      
         return Ok(Json(new_request));
     }
@@ -271,7 +271,7 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
                     // Already cached, return direct download link
                     let mut new_request = request.request.clone();
                     new_request.url = format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", t.id, file.id);
-                    new_request.status = RsRequestStatus::FinalPrivate; // Direct download link
+                    new_request.status = RsRequestStatus::FinalPublic; // Direct download link
                     new_request.permanent = true;      
                     return Ok(Json(new_request));
                 }
@@ -283,7 +283,7 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
         let url = get_file_download_url(&request.request, &torrent_info, token, true)?;
         let mut final_request = request.request.clone();
         final_request.url = url;
-        final_request.status = RsRequestStatus::FinalPrivate;
+        final_request.status = RsRequestStatus::FinalPublic;
         final_request.permanent = true;
         final_request.mime = Some("applications/torbox".to_owned());
         Ok(Json(final_request))
@@ -292,7 +292,7 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
         let mut new_request = request.request.clone();
         new_request.url = request.request.url.replacen("https://", "torbox://", 1).replace(token, "_TOKEN_");
-        new_request.status = RsRequestStatus::FinalPrivate; // Direct download link
+        new_request.status = RsRequestStatus::FinalPublic; // Direct download link
         new_request.permanent = true;      
         return Ok(Json(new_request));
     } else {
@@ -464,7 +464,7 @@ fn handle_magnet_request(request: &RsRequest, password: &str) -> FnResult<Json<R
                 let download_url = get_file_download_url(request, &torrent_info, password, true)?.replace("torbox://", "https://").replace("_TOKEN_", password);
 
                 let mut new_request = request.clone();
-                new_request.status = RsRequestStatus::FinalPrivate;
+                new_request.status = RsRequestStatus::FinalPublic;
                 new_request.url = download_url;
                 new_request.permanent = false;
                 Ok(Json(new_request))
