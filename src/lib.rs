@@ -240,7 +240,7 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not available for instant download"), 404))?;
 
         log!(LogLevel::Debug, "Torrent Info {:?}\n\n", torrent_info );
-        if torrent_info.files.clone().unwrap_or_default().len() > 1 && request.request.selected_file.is_none() {
+        if torrent_info.files.as_ref().map(|f| f.len()).unwrap_or(0) > 1 && request.request.selected_file.is_none() {
             let mut result = request.request.clone();
             result.status = RsRequestStatus::NeedFileSelection;
             result.permanent = false;
@@ -460,7 +460,7 @@ fn get_search_query_and_params(query: &RsLookupQuery) -> (String, Option<(u32, O
 fn handle_magnet_request(request: &RsRequest, password: &str) -> FnResult<Json<RsRequest>> {
     match check_instant(request, password)? {
         Some(torrent_info) => {
-            if torrent_info.files.clone().unwrap_or_default().len() > 1 && request.selected_file.is_none() {
+            if torrent_info.files.as_ref().map(|f| f.len()).unwrap_or(0) > 1 && request.selected_file.is_none() {
                 let mut result = request.clone();
                 result.status = RsRequestStatus::NeedFileSelection;
                 result.files = Some(torrent_info.files.unwrap_or_default().into_iter().map(|l| {
