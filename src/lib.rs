@@ -19,7 +19,7 @@ struct TorrentInfo {
     //name: String,
     //size: u64,
     //hash: String,
-    files: Vec<FileInfo>,
+    files: Option<Vec<FileInfo>>,
 }
 
 
@@ -73,7 +73,7 @@ pub struct MyTorrent {
     // pub torrent_file: bool,
     // pub expires_at: Option<String>,
     // pub download_present: bool,
-    pub files: Vec<MyFile>,
+    pub files: Option<Vec<MyFile>>,
     // pub download_path: String,
     // pub availability: i64,
     // pub download_finished: bool,
@@ -240,11 +240,11 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not available for instant download"), 404))?;
 
         log!(LogLevel::Debug, "Torrent Info {:?}\n\n", torrent_info );
-        if torrent_info.files.len() > 1 && request.request.selected_file.is_none() {
+        if torrent_info.files.clone().unwrap_or_default().len() > 1 && request.request.selected_file.is_none() {
             let mut result = request.request.clone();
             result.status = RsRequestStatus::NeedFileSelection;
             result.permanent = false;
-            result.files = Some(torrent_info.files.into_iter().map(|l| {
+            result.files = Some(torrent_info.files.unwrap_or_default().into_iter().map(|l| {
                 let mut file = RsRequestFiles { name: l.short_name, size: l.size, mime: Some(l.mimetype), ..Default::default()};
                 file.parse_filename();
                 file
@@ -266,7 +266,7 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
 
         if let Some(t) = existing {
             if t.cached {
-                if let Some(file) = t.files.iter().find(|f| { f.short_name == request.request.selected_file.clone().unwrap_or_default() || f.name == request.request.selected_file.clone().unwrap_or_default() }) {
+                if let Some(file) = t.files.unwrap_or_default().iter().find(|f| { f.short_name == request.request.selected_file.clone().unwrap_or_default() || f.name == request.request.selected_file.clone().unwrap_or_default() }) {
                     log!(LogLevel::Info, "File already cached: {}", file.name);
                     // Already cached, return direct download link
                     let mut new_request = request.request.clone();
@@ -449,10 +449,10 @@ fn get_search_query_and_params(query: &RsLookupQuery) -> (String, Option<(u32, O
 fn handle_magnet_request(request: &RsRequest, password: &str) -> FnResult<Json<RsRequest>> {
     match check_instant(request, password)? {
         Some(torrent_info) => {
-            if torrent_info.files.len() > 1 && request.selected_file.is_none() {
+            if torrent_info.files.clone().unwrap_or_default().len() > 1 && request.selected_file.is_none() {
                 let mut result = request.clone();
                 result.status = RsRequestStatus::NeedFileSelection;
-                result.files = Some(torrent_info.files.into_iter().map(|l| {
+                result.files = Some(torrent_info.files.unwrap_or_default().into_iter().map(|l| {
                 let mut file = RsRequestFiles { name: l.short_name, size: l.size, mime: Some(l.mimetype), ..Default::default()};
                     file.parse_filename();
                     file
@@ -635,7 +635,7 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
 
     let files = &torrent_info.files;
 
-    if files.is_empty() {
+    if files.is_none() || files.as_ref().unwrap_or(&vec![]).is_empty() {
         return Err(WithReturnCode(extism_pdk::Error::msg("No files found in torrent"), 404));
     }
 
@@ -675,7 +675,9 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
 
 
     let my_torrent = get_my_torrent(token, torrent_id)?;
-    let file = my_torrent.files.iter().find(|f| { f.short_name == request.selected_file.clone().unwrap_or_default() || f.name == request.selected_file.clone().unwrap_or_default() }).ok_or(extism_pdk::Error::msg(format!("Add torrent - Unable to find file({:?}) in {:?}", request.selected_file, my_torrent.files)))?;
+    let binding = vec![];
+    let binding = my_torrent.files.as_ref().unwrap_or(&binding);
+    let file = binding.iter().find(|f| { f.short_name == request.selected_file.clone().unwrap_or_default() || f.name == request.selected_file.clone().unwrap_or_default() }).ok_or(extism_pdk::Error::msg(format!("Add torrent - Unable to find file({:?}) in {:?}", request.selected_file, my_torrent.files)))?;
     let file_id = file.id;
 
     if permanent {
