@@ -293,12 +293,13 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
 
 
         log!(LogLevel::Info, "Getting file download link by adding it to your torrents {:?}\n", canonical_hash );
-        let (url, mime) = get_file_download_url(&request.request, &torrent_info, token, true)?;
+        let (url, file) = get_file_download_url(&request.request, &torrent_info, token, true)?;
         let mut final_request = request.request.clone();
         final_request.url = url;
         final_request.status = RsRequestStatus::FinalPublic;
         final_request.permanent = true;
-        final_request.mime = Some(mime);
+        final_request.mime = Some(file.mimetype.clone());
+        final_request.filename = Some(file.name.clone());
         Ok(Json(final_request))
     } else if request.request.url.starts_with("https://api.torbox.app/v1/api/torrents/requestdl") {
         let token = &request.credential.and_then(|c| c.password)
@@ -474,12 +475,13 @@ fn handle_magnet_request(request: &RsRequest, password: &str) -> FnResult<Json<R
                 Ok(Json(result))
             } else {
                 // instant available, get file download URL
-                let (url, mime) = get_file_download_url(request, &torrent_info, password, true)?;
+                let (url, file) = get_file_download_url(request, &torrent_info, password, true)?;
                 let download_url = url.replace("torbox://", "https://").replace("_TOKEN_", password);
                 let mut new_request = request.clone();
                 new_request.status = RsRequestStatus::FinalPublic;
                 new_request.url = download_url;
-                new_request.mime = Some(mime);
+                new_request.mime = Some(file.mimetype.clone());
+                new_request.filename = Some(file.name.clone());
                 new_request.permanent = false;
                 Ok(Json(new_request))
             }
@@ -645,7 +647,7 @@ fn get_my_torrent(token: &str, id: i32) -> FnResult<MyTorrent> {
    Ok(response.data)
 }
 
-fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token: &str, permanent: bool) -> FnResult<(String, String)> {
+fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token: &str, permanent: bool) -> FnResult<(String, MyFile)> {
 
     let files = &torrent_info.files;
 
@@ -700,7 +702,7 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
     
     if permanent {
         // For permanent requests, we are done here
-        return Ok((format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", torrent_id, file_id), file.mimetype.clone()));
+        return Ok((format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", torrent_id, file_id), file.clone()));
     }
     // Request download link
     let dl_req = HttpRequest {
@@ -723,7 +725,7 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
         return Err(WithReturnCode(extism_pdk::Error::msg(err_msg), 500));
     }
 
-    Ok((dl_response.data, file.mimetype.clone()))
+    Ok((dl_response.data, file.clone()))
 }
 
 
