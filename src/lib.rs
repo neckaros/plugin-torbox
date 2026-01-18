@@ -197,8 +197,28 @@ struct Torrent {
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(
-        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 1, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
+        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 2, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
     ))
+}
+
+#[plugin_fn]
+pub fn check_instant(Json(request): Json<RsRequestPluginRequest>) -> FnResult<Json<bool>> {
+    // torbox:// URLs are already processed and always instant
+    if request.request.url.starts_with("torbox://") {
+        return Ok(Json(true));
+    }
+
+    // Only magnet links can be checked for instant availability
+    if !request.request.url.starts_with("magnet:") {
+        return Ok(Json(false));
+    }
+
+    let token = request.credential
+        .and_then(|c| c.password)
+        .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
+
+    let result = check_instant_internal(&request.request, &token)?;
+    Ok(Json(result.is_some()))
 }
 
 #[plugin_fn]
@@ -236,7 +256,7 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
         let token = &request.credential.and_then(|c| c.password)
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
 
-        let torrent_info = check_instant(&request.request, token)?
+        let torrent_info = check_instant_internal(&request.request, token)?
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not available for instant download"), 404))?;
 
         log!(LogLevel::Debug, "Torrent Info {:?}\n\n", torrent_info );
@@ -380,7 +400,7 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
         let r = RsRequest {
             url: magnet,
             permanent: true,
-            instant: true,
+            instant: Some(t.cached),
             filename: Some(t.raw_title.clone()),
             language: t.title_parsed_data.language.as_ref().map(|l| match l {
                 StringOrArray::Single(s) => s.clone(),
@@ -460,7 +480,7 @@ fn get_search_query_and_params(query: &RsLookupQuery) -> (String, Option<(u32, O
 
 
 fn handle_magnet_request(request: &RsRequest, password: &str) -> FnResult<Json<RsRequest>> {
-    match check_instant(request, password)? {
+    match check_instant_internal(request, password)? {
         Some(torrent_info) => {
             if torrent_info.files.as_ref().map(|f| f.len()).unwrap_or(0) > 1 && request.selected_file.is_none() {
                 let mut result = request.clone();
@@ -558,7 +578,7 @@ fn get_canonical_hash(raw_hash: &str) -> FnResult<String> {
     Ok(hash)
 }
 
-fn check_instant(request: &RsRequest, token: &str) -> FnResult<Option<TorrentInfo>> {
+fn check_instant_internal(request: &RsRequest, token: &str) -> FnResult<Option<TorrentInfo>> {
     let raw_hash = extract_btih_hash(&request.url)
         .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("Invalid magnet link: no BTIH hash found"), 400))?;
     let canonical_hash = get_canonical_hash(&raw_hash)?;
