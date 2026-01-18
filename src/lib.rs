@@ -373,45 +373,44 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
 
     let mut requests = Vec::new();
     for t in response.data.unwrap().torrents {
-        if t.cached {
-            let magnet = t.magnet.clone().unwrap_or_else(|| {
-                format!("magnet:?xt=urn:btih:{}&dn={}", t.hash, encode(&t.title))
-            });
+        let magnet = t.magnet.clone().unwrap_or_else(|| {
+            format!("magnet:?xt=urn:btih:{}&dn={}", t.hash, encode(&t.title))
+        });
 
-            let r = RsRequest {
-                url: magnet,
-                permanent: false,
-                filename: Some(t.raw_title.clone()),
-                language: t.title_parsed_data.language.as_ref().map(|l| match l {
-                    StringOrArray::Single(s) => s.clone(),
-                    StringOrArray::Array(vs) => vs.join(", "),
-                }),
-                season: t.title_parsed_data.season.as_ref().and_then(|s| match s {
-                    U32OrArray::Single(v) => Some(*v),
-                    U32OrArray::Array(vs) => vs.first().cloned(),
-                }),
-                episode: t.title_parsed_data.episode.as_ref().and_then(|s| match s {
-                    U32OrArray::Single(v) => Some(*v),
-                    U32OrArray::Array(vs) => vs.first().cloned(),
-                }),
-                videocodec: t.title_parsed_data.codec.as_ref().map(|a| match RsVideoCodec::from_filename(a) {
-                    RsVideoCodec::Unknown => RsVideoCodec::Custom(a.clone()),
-                    other => other,
-                }),
-                audio: t.title_parsed_data.audio.as_ref().map(|a| match RsAudio::from_filename(a) {
-                    RsAudio::Unknown => RsAudio::Custom(a.clone()),
-                    other => other,
-                }).map(|a| vec![a]),
-                resolution: t.title_parsed_data.resolution.as_ref().map(|a| match RsResolution::from_filename(a) {
-                    RsResolution::Unknown => RsResolution::Custom(a.clone()),
-                    other => other,
-                }),
-                size: Some(t.size),
-                ..Default::default()
-            };
-            // TODO: Set resolution, codec from quality if parsed
-            requests.push(r);
-        }
+        let r = RsRequest {
+            url: magnet,
+            permanent: true,
+            instant: true,
+            filename: Some(t.raw_title.clone()),
+            language: t.title_parsed_data.language.as_ref().map(|l| match l {
+                StringOrArray::Single(s) => s.clone(),
+                StringOrArray::Array(vs) => vs.join(", "),
+            }),
+            season: t.title_parsed_data.season.as_ref().and_then(|s| match s {
+                U32OrArray::Single(v) => Some(*v),
+                U32OrArray::Array(vs) => vs.first().cloned(),
+            }),
+            episode: t.title_parsed_data.episode.as_ref().and_then(|s| match s {
+                U32OrArray::Single(v) => Some(*v),
+                U32OrArray::Array(vs) => vs.first().cloned(),
+            }),
+            videocodec: t.title_parsed_data.codec.as_ref().map(|a| match RsVideoCodec::from_filename(a) {
+                RsVideoCodec::Unknown => RsVideoCodec::Custom(a.clone()),
+                other => other,
+            }),
+            audio: t.title_parsed_data.audio.as_ref().map(|a| match RsAudio::from_filename(a) {
+                RsAudio::Unknown => RsAudio::Custom(a.clone()),
+                other => other,
+            }).map(|a| vec![a]),
+            resolution: t.title_parsed_data.resolution.as_ref().map(|a| match RsResolution::from_filename(a) {
+                RsResolution::Unknown => RsResolution::Custom(a.clone()),
+                other => other,
+            }),
+            size: Some(t.size),
+            ..Default::default()
+        };
+        // TODO: Set resolution, codec from quality if parsed
+        requests.push(r);
     }
 
     if requests.is_empty() {
