@@ -506,8 +506,10 @@ fn handle_magnet_request(request: &RsRequest, password: &str) -> FnResult<Json<R
             }
         },
         None => {
-            // not available
-            Err(WithReturnCode::new(extism_pdk::Error::msg("Not available for instant download"), 404))
+            // Not available for instant - mark as requiring add to torrent list
+            let mut result = request.clone();
+            result.status = RsRequestStatus::RequireAdd;
+            Ok(Json(result))
         }
     }
 }
