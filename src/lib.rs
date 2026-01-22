@@ -360,14 +360,8 @@ pub fn request_add(Json(request): Json<RsRequestPluginRequest>) -> FnResult<Json
     let torrent = get_my_torrent(&token, torrent_id)?;
     let status = map_download_state_to_status(torrent.download_state.as_deref(), torrent.cached);
 
-    // Calculate ETA as UTC timestamp in milliseconds
-    let eta = torrent.eta.filter(|&e| e > 0).map(|e| {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        now_ms + (e * 1000)
-    });
+    // Return relative ETA in milliseconds (host will convert to absolute timestamp)
+    let eta = torrent.eta.filter(|&e| e > 0).map(|e| e * 1000);
 
     Ok(Json(RsRequestAddResponse {
         processing_id: torrent_id.to_string(),
@@ -392,14 +386,8 @@ pub fn get_progress(Json(request): Json<RsProcessingActionRequest>) -> FnResult<
     // Convert progress from 0.0-1.0 to 0-100
     let progress = (torrent.progress.unwrap_or(0.0) * 100.0) as u32;
 
-    // Calculate ETA as UTC timestamp in milliseconds
-    let eta = torrent.eta.filter(|&e| e > 0).map(|e| {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        now_ms + (e * 1000)
-    });
+    // Return relative ETA in milliseconds (host will convert to absolute timestamp)
+    let eta = torrent.eta.filter(|&e| e > 0).map(|e| e * 1000);
 
     // If finished, construct the final request with download URL
     let final_request = if status == RsProcessingStatus::Finished {
