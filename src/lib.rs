@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use extism_pdk::*;
-use rs_plugin_common_interfaces::{CredentialType, PluginInformation, PluginType, RsAudio, RsLookupQuery, RsLookupSourceResult, RsLookupWrapper, RsRequest, RsRequestFiles, RsRequestPluginRequest, RsRequestStatus, RsResolution, RsVideoCodec};
+use rs_plugin_common_interfaces::{CredentialType, PluginInformation, PluginType, RsAudio, RsResolution, RsVideoCodec};
+use rs_plugin_common_interfaces::lookup::{RsLookupQuery, RsLookupSourceResult, RsLookupWrapper};
+use rs_plugin_common_interfaces::request::{RsRequest, RsRequestFiles, RsRequestPluginRequest, RsRequestStatus, RsProcessingActionRequest, RsRequestAddResponse, RsProcessingProgress, RsProcessingStatus};
 use serde::Deserialize;
 use urlencoding::encode;
 
@@ -58,25 +60,25 @@ pub struct MyTorrent {
     pub hash: String,
     pub name: String,
     pub magnet: Option<String>,
-    // pub size: u64,
+    pub size: Option<u64>,
     // pub active: bool,
     // pub created_at: String,
     // pub updated_at: String,
-    // pub download_state: String,
+    pub download_state: Option<String>,
     // pub seeds: i64,
     // pub peers: i64,
     // pub ratio: f64,
-    // pub progress: f64,
+    pub progress: Option<f64>,
     // pub download_speed: i64,
     // pub upload_speed: i64,
-    // pub eta: i64,
+    pub eta: Option<i64>,
     // pub torrent_file: bool,
     // pub expires_at: Option<String>,
     // pub download_present: bool,
     pub files: Option<Vec<MyFile>>,
     // pub download_path: String,
     // pub availability: i64,
-    // pub download_finished: bool,
+    pub download_finished: Option<bool>,
     // pub tracker: Option<String>,
     // pub total_uploaded: i64,
     // pub total_downloaded: i64,
@@ -132,6 +134,13 @@ struct DownloadLinkResponse {
     error: Option<String>,
     //detail: String,
     data: String,
+}
+
+#[derive(Deserialize)]
+struct ControlTorrentResponse {
+    success: bool,
+    error: Option<String>,
+    detail: String,
 }
 
 #[derive(Deserialize)]
@@ -197,7 +206,7 @@ struct Torrent {
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(
-        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 2, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
+        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 3, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
     ))
 }
 
@@ -332,6 +341,112 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
     } else {
         Err(WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404))
     }
+}
+
+#[plugin_fn]
+pub fn request_add(Json(request): Json<RsRequestPluginRequest>) -> FnResult<Json<RsRequestAddResponse>> {
+    // Only supports magnet links
+    if !request.request.url.starts_with("magnet:") {
+        return Err(WithReturnCode::new(extism_pdk::Error::msg("Only magnet links are supported for request_add"), 400));
+    }
+
+    let token = request.credential
+        .and_then(|c| c.password)
+        .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
+
+    let torrent_id = create_torrent_for_download(&request.request.url, &token)?;
+
+    // Get initial status
+    let torrent = get_my_torrent(&token, torrent_id)?;
+    let status = map_download_state_to_status(torrent.download_state.as_deref(), torrent.cached);
+
+    // Calculate ETA as UTC timestamp in milliseconds
+    let eta = torrent.eta.filter(|&e| e > 0).map(|e| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        now_ms + (e * 1000)
+    });
+
+    Ok(Json(RsRequestAddResponse {
+        processing_id: torrent_id.to_string(),
+        status,
+        eta,
+    }))
+}
+
+#[plugin_fn]
+pub fn get_progress(Json(request): Json<RsProcessingActionRequest>) -> FnResult<Json<RsProcessingProgress>> {
+    let token = request.credential
+        .and_then(|c| c.password)
+        .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
+
+    let torrent_id: i32 = request.processing_id.parse()
+        .map_err(|_| WithReturnCode::new(extism_pdk::Error::msg("Invalid processing_id"), 400))?;
+
+    let torrent = get_my_torrent(&token, torrent_id)?;
+
+    let status = map_download_state_to_status(torrent.download_state.as_deref(), torrent.cached);
+
+    // Convert progress from 0.0-1.0 to 0-100
+    let progress = (torrent.progress.unwrap_or(0.0) * 100.0) as u32;
+
+    // Calculate ETA as UTC timestamp in milliseconds
+    let eta = torrent.eta.filter(|&e| e > 0).map(|e| {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        now_ms + (e * 1000)
+    });
+
+    // If finished, construct the final request with download URL
+    let final_request = if status == RsProcessingStatus::Finished {
+        let selected_file = request.params.as_ref().and_then(|p| p.get("selected_file").map(|s| s.as_str()));
+        match construct_final_request(&torrent, selected_file) {
+            Ok(req) => Some(Box::new(req)),
+            Err(e) => {
+                log!(LogLevel::Warn, "Failed to construct final request: {:?}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    Ok(Json(RsProcessingProgress {
+        processing_id: request.processing_id,
+        progress,
+        status,
+        error: None,
+        eta,
+        request: final_request,
+    }))
+}
+
+#[plugin_fn]
+pub fn pause(Json(request): Json<RsProcessingActionRequest>) -> FnResult<()> {
+    let token = request.credential
+        .and_then(|c| c.password)
+        .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
+
+    let torrent_id: i32 = request.processing_id.parse()
+        .map_err(|_| WithReturnCode::new(extism_pdk::Error::msg("Invalid processing_id"), 400))?;
+
+    control_torrent(&token, torrent_id, "pause")
+}
+
+#[plugin_fn]
+pub fn remove(Json(request): Json<RsProcessingActionRequest>) -> FnResult<()> {
+    let token = request.credential
+        .and_then(|c| c.password)
+        .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
+
+    let torrent_id: i32 = request.processing_id.parse()
+        .map_err(|_| WithReturnCode::new(extism_pdk::Error::msg("Invalid processing_id"), 400))?;
+
+    control_torrent(&token, torrent_id, "delete")
 }
 
 #[plugin_fn]
@@ -749,5 +864,121 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
     Ok((dl_response.data, file.clone()))
 }
 
+/// Creates a torrent for async download (without add_only_if_cached flag)
+fn create_torrent_for_download(magnet_url: &str, token: &str) -> FnResult<i32> {
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+    headers.insert("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string());
 
+    let magnet_encoded = encode(magnet_url);
+    let body_str = format!("magnet={}", magnet_encoded);
+    let body_vec = body_str.as_bytes().to_vec();
+
+    let create_req = HttpRequest {
+        url: "https://api.torbox.app/v1/api/torrents/createtorrent".to_string(),
+        headers,
+        method: Some("POST".into()),
+    };
+
+    let create_res = http::request::<Vec<u8>>(&create_req, Some(body_vec))?;
+
+    if create_res.status_code() != 200 {
+        let error_msg = String::from_utf8_lossy(&create_res.body()).to_string();
+        return Err(WithReturnCode(extism_pdk::Error::msg(format!("Create torrent HTTP {}: {}", create_res.status_code(), error_msg)), create_res.status_code() as i32));
+    }
+
+    let create_response: CreateTorrentResponse = create_res.json()
+        .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON parse error during create torrent: {}", e)), 500))?;
+
+    if let Some(err_msg) = create_response.error {
+        return Err(WithReturnCode(extism_pdk::Error::msg(err_msg), 500));
+    }
+
+    Ok(create_response.data.torrent_id)
+}
+
+/// Controls a torrent (pause or delete)
+fn control_torrent(token: &str, torrent_id: i32, operation: &str) -> FnResult<()> {
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+    headers.insert("Content-Type".to_string(), "application/json".to_string());
+
+    let body = format!(r#"{{"torrent_id": {}, "operation": "{}"}}"#, torrent_id, operation);
+    let body_vec = body.as_bytes().to_vec();
+
+    let req = HttpRequest {
+        url: "https://api.torbox.app/v1/api/torrents/controltorrent".to_string(),
+        headers,
+        method: Some("POST".into()),
+    };
+
+    let res = http::request::<Vec<u8>>(&req, Some(body_vec))?;
+
+    if res.status_code() != 200 {
+        let error_msg = String::from_utf8_lossy(&res.body()).to_string();
+        return Err(WithReturnCode(extism_pdk::Error::msg(format!("Control torrent HTTP {}: {}", res.status_code(), error_msg)), res.status_code() as i32));
+    }
+
+    let response: ControlTorrentResponse = res.json()
+        .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON parse error during control torrent: {}", e)), 500))?;
+
+    if !response.success {
+        return Err(WithReturnCode(extism_pdk::Error::msg(response.error.unwrap_or(response.detail)), 500));
+    }
+
+    Ok(())
+}
+
+/// Maps Torbox download_state to RsProcessingStatus
+fn map_download_state_to_status(download_state: Option<&str>, cached: bool) -> RsProcessingStatus {
+    if cached {
+        return RsProcessingStatus::Finished;
+    }
+
+    match download_state {
+        Some("downloading") | Some("metaDL") | Some("checking") | Some("queued") => RsProcessingStatus::Processing,
+        Some("completed") | Some("uploading") | Some("seeding") => RsProcessingStatus::Finished,
+        Some("paused") | Some("stalled") => RsProcessingStatus::Paused,
+        Some("error") | Some("failed") => RsProcessingStatus::Error,
+        _ => RsProcessingStatus::Processing, // Default to processing for unknown states
+    }
+}
+
+/// Constructs the final RsRequest with download URL when torrent is finished
+fn construct_final_request(torrent: &MyTorrent, selected_file: Option<&str>) -> FnResult<RsRequest> {
+    let files = torrent.files.as_ref().ok_or_else(||
+        WithReturnCode(extism_pdk::Error::msg("No files found in torrent"), 404))?;
+
+    if files.is_empty() {
+        return Err(WithReturnCode(extism_pdk::Error::msg("No files found in torrent"), 404));
+    }
+
+    let file = if files.len() == 1 {
+        &files[0]
+    } else if let Some(selected) = selected_file {
+        files.iter()
+            .find(|f| f.short_name == selected || f.name == selected)
+            .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg(format!("Selected file '{}' not found", selected)), 404))?
+    } else {
+        // Pick the largest file
+        files.iter()
+            .max_by_key(|f| f.size)
+            .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("No files found"), 404))?
+    };
+
+    let url = format!(
+        "torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}",
+        torrent.id, file.id
+    );
+
+    Ok(RsRequest {
+        url,
+        status: RsRequestStatus::FinalPublic,
+        permanent: true,
+        mime: Some(file.mimetype.clone()),
+        filename: Some(file.name.clone()),
+        size: Some(file.size),
+        ..Default::default()
+    })
+}
 
