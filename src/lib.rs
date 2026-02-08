@@ -28,7 +28,7 @@ struct TorrentInfo {
 #[derive(Deserialize, Debug, Clone)]
 struct FileInfo {
     //name: String,
-    size: u64,
+    size: i64,
     //opensubtitles_hash: Option<String>,
     short_name: String,
     mimetype: String,
@@ -60,7 +60,7 @@ pub struct MyTorrent {
     pub hash: String,
     pub name: String,
     pub magnet: Option<String>,
-    pub size: Option<u64>,
+    pub size: Option<i64>,
     // pub active: bool,
     // pub created_at: String,
     // pub updated_at: String,
@@ -98,7 +98,7 @@ pub struct MyFile {
     pub md5: Option<String>,
     pub hash: String,
     pub name: String,
-    pub size: u64,
+    pub size: i64,
     pub zipped: bool,
     pub s3_path: String,
     pub infected: bool,
@@ -190,7 +190,7 @@ struct Torrent {
     //torrent: Option<String>,
     //last_known_seeders: u32,
     //last_known_peers: u32,
-    size: u64,
+    size: i64,
     //tracker: String,
     //categories: Vec<String>,
     //files: u32,
@@ -274,7 +274,7 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
             result.status = RsRequestStatus::NeedFileSelection;
             result.permanent = false;
             result.files = Some(torrent_info.files.unwrap_or_default().into_iter().map(|l| {
-                let mut file = RsRequestFiles { name: l.short_name, size: l.size, mime: Some(l.mimetype), ..Default::default()};
+                let mut file = RsRequestFiles { name: l.short_name, size: l.size.max(0) as u64, mime: Some(l.mimetype), ..Default::default()};
                 file.parse_filename();
                 file
             }).collect());
@@ -529,7 +529,7 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
                 RsResolution::Unknown => RsResolution::Custom(a.clone()),
                 other => other,
             }),
-            size: Some(t.size),
+            size: Some(t.size.max(0) as u64),
             ..Default::default()
         };
         // TODO: Set resolution, codec from quality if parsed
@@ -589,7 +589,7 @@ fn handle_magnet_request(request: &RsRequest, password: &str) -> FnResult<Json<R
                 let mut result = request.clone();
                 result.status = RsRequestStatus::NeedFileSelection;
                 result.files = Some(torrent_info.files.unwrap_or_default().into_iter().map(|l| {
-                let mut file = RsRequestFiles { name: l.short_name, size: l.size, mime: Some(l.mimetype), ..Default::default()};
+                let mut file = RsRequestFiles { name: l.short_name, size: l.size.max(0) as u64, mime: Some(l.mimetype), ..Default::default()};
                     file.parse_filename();
                     file
                 }).collect());
@@ -965,7 +965,7 @@ fn construct_final_request(torrent: &MyTorrent, selected_file: Option<&str>) -> 
         permanent: true,
         mime: Some(file.mimetype.clone()),
         filename: Some(file.name.clone()),
-        size: Some(file.size),
+        size: Some(file.size.max(0) as u64),
         ..Default::default()
     })
 }
