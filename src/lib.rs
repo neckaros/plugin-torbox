@@ -453,7 +453,10 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     headers.insert("Authorization".to_string(), format!("Bearer {}", token));
 
-    let (search_query, season_episode) = get_search_query_and_params(&lookup.query);
+    let (search_query, season_episode) = match get_search_query_and_params(&lookup.query) {
+        Ok(result) => result,
+        Err(_) => return Ok(Json(RsLookupSourceResult::NotApplicable)),
+    };
     log!(LogLevel::Info, "Search query:\nfrom: {:?}\nto: {:?} / {:?}", lookup, search_query, season_episode);
     if search_query.is_empty() {
         return Ok(Json(RsLookupSourceResult::NotApplicable));
@@ -543,41 +546,47 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
     }
 }
 
-fn get_search_query_and_params(query: &RsLookupQuery) -> (String, Option<(u32, Option<u32>)>) {
+fn get_search_query_and_params(query: &RsLookupQuery) -> FnResult<(String, Option<(u32, Option<u32>)>)> {
     match query {
         RsLookupQuery::Movie(m) => {
             if let Some(ids) = &m.ids {
                 if let Some(id_str) = ids.imdb.as_ref().map(|u| format!("imdb:{}", u))
                     .or(ids.tmdb.map(|s| format!("tmdb:{}", s)))
                     .or(ids.tvdb.map(|u| format!("tvdb:{}", u))) {
-                    return (id_str, None);
+                    return Ok((id_str, None));
                 }
             }
-            (m.name.clone(), None)
+            let name = m.name.clone()
+                .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404))?;
+            Ok((name, None))
         },
         RsLookupQuery::Episode(e) => {
             let ep_num = e.number.unwrap_or(1);
-            let base_query = format!("{} S{:02}E{:02}", e.serie, e.season, ep_num);
             if let Some(ids) = &e.ids {
                 if let Some(id_str) = ids.imdb.as_ref().map(|u| format!("imdb:{}", u))
                     .or(ids.tmdb.map(|s| format!("tmdb:{}", s)))
                     .or(ids.tvdb.map(|u| format!("tvdb:{}", u))) {
-                    return (id_str, Some((e.season, Some(ep_num))));
+                    return Ok((id_str, Some((e.season, Some(ep_num)))));
                 }
             }
-            (base_query, None)
+            let name = e.name.clone()
+                .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404))?;
+            let base_query = format!("{} S{:02}E{:02}", name, e.season, ep_num);
+            Ok((base_query, None))
         },
         RsLookupQuery::SerieSeason(s) => {
             if let Some(ids) = &s.ids {
                 if let Some(id_str) = ids.imdb.as_ref().map(|u| format!("imdb:{}", u))
                     .or(ids.tmdb.map(|s| format!("tmdb:{}", s)))
                     .or(ids.tvdb.map(|u| format!("tvdb:{}", u))) {
-                    return (id_str, Some((s.name.parse().unwrap_or(1), None))); // Assume season from name or default
+                    return Ok((id_str, Some((s.name.as_deref().and_then(|n| n.parse().ok()).unwrap_or(1), None))));
                 }
             }
-            (format!("{} season", s.name), None)
+            let name = s.name.clone()
+                .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404))?;
+            Ok((format!("{} season", name), None))
         },
-        _ => (String::new(), None),
+        _ => Err(WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404)),
     }
 }
 

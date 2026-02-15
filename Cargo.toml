@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 extism-pdk = "1.4.1"
 serde = { version = "1", features = ["derive"] }
-rs-plugin-common-interfaces = "0.21.0"
+rs-plugin-common-interfaces = "0.26.0"
 strum = "0.26.2"
 strum_macros = "0.26.2"
 urlencoding = "2.1.3"
