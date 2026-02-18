@@ -206,7 +206,7 @@ struct Torrent {
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(
-        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 3, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
+        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 4, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
     ))
 }
 
@@ -894,6 +894,48 @@ fn create_torrent_for_download(magnet_url: &str, token: &str) -> FnResult<i32> {
     Ok(create_response.data.torrent_id)
 }
 
+fn is_not_found_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("not found")
+        || normalized.contains("no torrent")
+        || normalized.contains("does not exist")
+        || normalized.contains("doesn't exist")
+}
+
+fn is_torrent_absent(token: &str, torrent_id: i32) -> FnResult<bool> {
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+
+    let req = HttpRequest {
+        url: format!("https://api.torbox.app/v1/api/torrents/mylist?id={}&bypass_cache=true", torrent_id),
+        headers,
+        method: Some("GET".into()),
+    };
+
+    let res = http::request::<()>(&req, None)?;
+    let body = String::from_utf8_lossy(&res.body()).to_string();
+
+    if res.status_code() == 404 {
+        return Ok(true);
+    }
+
+    if res.status_code() != 200 {
+        return Ok(is_not_found_message(&body));
+    }
+
+    let response: MyTorrentResponse = match res.json() {
+        Ok(response) => response,
+        Err(_) => return Ok(false),
+    };
+
+    if !response.success {
+        let error_message = response.error.unwrap_or(response.detail);
+        return Ok(is_not_found_message(&error_message));
+    }
+
+    Ok(false)
+}
+
 /// Controls a torrent (pause or delete)
 fn control_torrent(token: &str, torrent_id: i32, operation: &str) -> FnResult<()> {
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
@@ -913,6 +955,9 @@ fn control_torrent(token: &str, torrent_id: i32, operation: &str) -> FnResult<()
 
     if res.status_code() != 200 {
         let error_msg = String::from_utf8_lossy(&res.body()).to_string();
+        if operation == "delete" && is_torrent_absent(token, torrent_id)? {
+            return Ok(());
+        }
         return Err(WithReturnCode(extism_pdk::Error::msg(format!("Control torrent HTTP {}: {}", res.status_code(), error_msg)), res.status_code() as i32));
     }
 
@@ -920,6 +965,9 @@ fn control_torrent(token: &str, torrent_id: i32, operation: &str) -> FnResult<()
         .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON parse error during control torrent: {}", e)), 500))?;
 
     if !response.success {
+        if operation == "delete" && is_torrent_absent(token, torrent_id)? {
+            return Ok(());
+        }
         return Err(WithReturnCode(extism_pdk::Error::msg(response.error.unwrap_or(response.detail)), 500));
     }
 
@@ -978,4 +1026,3 @@ fn construct_final_request(torrent: &MyTorrent, selected_file: Option<&str>) -> 
         ..Default::default()
     })
 }
-
