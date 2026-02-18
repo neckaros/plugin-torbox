@@ -144,6 +144,13 @@ struct ControlTorrentResponse {
 }
 
 #[derive(Deserialize)]
+struct TorboxStatusResponse {
+    success: Option<bool>,
+    error: Option<String>,
+    detail: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct SearchResponse {
     success: bool,
     error: Option<String>,
@@ -206,7 +213,7 @@ struct Torrent {
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(
-        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 4, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
+        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 5, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
     ))
 }
 
@@ -902,6 +909,12 @@ fn is_not_found_message(message: &str) -> bool {
         || normalized.contains("doesn't exist")
 }
 
+fn is_idempotent_delete_error(error: &str, detail: &str) -> bool {
+    is_not_found_message(error)
+        || is_not_found_message(detail)
+        || detail.eq_ignore_ascii_case("DATABASE_ERROR")
+}
+
 fn is_torrent_absent(token: &str, torrent_id: i32) -> FnResult<bool> {
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     headers.insert("Authorization".to_string(), format!("Bearer {}", token));
@@ -919,18 +932,22 @@ fn is_torrent_absent(token: &str, torrent_id: i32) -> FnResult<bool> {
         return Ok(true);
     }
 
-    if res.status_code() != 200 {
-        return Ok(is_not_found_message(&body));
+    if res.status_code() == 500 && body.trim().is_empty() {
+        return Ok(true);
     }
 
-    let response: MyTorrentResponse = match res.json() {
-        Ok(response) => response,
-        Err(_) => return Ok(false),
-    };
+    if let Ok(response) = res.json::<TorboxStatusResponse>() {
+        if response.success == Some(false) {
+            let message = response
+                .error
+                .or(response.detail)
+                .unwrap_or_default();
+            return Ok(is_not_found_message(&message));
+        }
+    }
 
-    if !response.success {
-        let error_message = response.error.unwrap_or(response.detail);
-        return Ok(is_not_found_message(&error_message));
+    if res.status_code() != 200 {
+        return Ok(is_not_found_message(&body));
     }
 
     Ok(false)
@@ -955,7 +972,21 @@ fn control_torrent(token: &str, torrent_id: i32, operation: &str) -> FnResult<()
 
     if res.status_code() != 200 {
         let error_msg = String::from_utf8_lossy(&res.body()).to_string();
-        if operation == "delete" && is_torrent_absent(token, torrent_id)? {
+        let parsed_error = res.json::<TorboxStatusResponse>().ok();
+        let has_idempotent_delete_error = parsed_error
+            .as_ref()
+            .map(|response| {
+                is_idempotent_delete_error(
+                    response.error.as_deref().unwrap_or_default(),
+                    response.detail.as_deref().unwrap_or_default(),
+                )
+            })
+            .unwrap_or(false);
+        if operation == "delete"
+            && (has_idempotent_delete_error
+                || (res.status_code() == 500 && error_msg.trim().is_empty())
+                || is_torrent_absent(token, torrent_id).unwrap_or(false))
+        {
             return Ok(());
         }
         return Err(WithReturnCode(extism_pdk::Error::msg(format!("Control torrent HTTP {}: {}", res.status_code(), error_msg)), res.status_code() as i32));
@@ -965,10 +996,15 @@ fn control_torrent(token: &str, torrent_id: i32, operation: &str) -> FnResult<()
         .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON parse error during control torrent: {}", e)), 500))?;
 
     if !response.success {
-        if operation == "delete" && is_torrent_absent(token, torrent_id)? {
+        let response_detail = response.detail.clone();
+        let response_error = response.error.unwrap_or(response_detail.clone());
+        if operation == "delete"
+            && (is_idempotent_delete_error(&response_error, &response_detail)
+                || is_torrent_absent(token, torrent_id).unwrap_or(false))
+        {
             return Ok(());
         }
-        return Err(WithReturnCode(extism_pdk::Error::msg(response.error.unwrap_or(response.detail)), 500));
+        return Err(WithReturnCode(extism_pdk::Error::msg(response_error), 500));
     }
 
     Ok(())
