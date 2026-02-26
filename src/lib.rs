@@ -213,7 +213,7 @@ struct Torrent {
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(
-        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 6, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
+        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 7, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
     ))
 }
 
@@ -398,7 +398,7 @@ pub fn get_progress(Json(request): Json<RsProcessingActionRequest>) -> FnResult<
 
     // If finished, construct the final request with download URL
     let final_request = if status == RsProcessingStatus::Finished {
-        let selected_file = request.params.as_ref().and_then(|p| p.get("selected_file").map(|s| s.as_str()));
+        let selected_file = None;//request.params.as_ref().and_then(|p| p.get("selected_file").map(|s| s.as_str()));
         match construct_final_request(&torrent, selected_file) {
             Ok(req) => Some(Box::new(req)),
             Err(e) => {

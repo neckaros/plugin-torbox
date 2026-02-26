@@ -1,6 +1,6 @@
 [package]
 name = "redseat_plugin_torbox"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 extism-pdk = "1.4.1"
 serde = { version = "1", features = ["derive"] }
-rs-plugin-common-interfaces = "0.29.10"
+rs-plugin-common-interfaces = "0.32.0"
 strum = "0.26.2"
 strum_macros = "0.26.2"
 urlencoding = "2.1.3"
