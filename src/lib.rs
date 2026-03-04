@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use extism_pdk::*;
-use rs_plugin_common_interfaces::{CredentialType, PluginInformation, PluginType, RsAudio, RsResolution, RsVideoCodec};
+use rs_plugin_common_interfaces::{CredentialType, CustomParamTypes, PluginInformation, PluginType, RsAudio, RsResolution, RsVideoCodec};
 use rs_plugin_common_interfaces::lookup::{RsLookupQuery, RsLookupSourceResult, RsLookupWrapper};
 use rs_plugin_common_interfaces::request::{RsRequest, RsRequestFiles, RsRequestPluginRequest, RsRequestStatus, RsProcessingActionRequest, RsRequestAddResponse, RsProcessingProgress, RsProcessingStatus};
 use serde::Deserialize;
@@ -213,7 +213,7 @@ struct Torrent {
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(
-        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 7, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
+        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 8, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
     ))
 }
 
@@ -398,7 +398,10 @@ pub fn get_progress(Json(request): Json<RsProcessingActionRequest>) -> FnResult<
 
     // If finished, construct the final request with download URL
     let final_request = if status == RsProcessingStatus::Finished {
-        let selected_file = None;//request.params.as_ref().and_then(|p| p.get("selected_file").map(|s| s.as_str()));
+        let selected_file = request.params.as_ref().and_then(|p| p.get("selected_file")).and_then(|s| match s {
+            CustomParamTypes::Text(v) | CustomParamTypes::Url(v) => v.as_deref(),
+            _ => None,
+        });
         match construct_final_request(&torrent, selected_file) {
             Ok(req) => Some(Box::new(req)),
             Err(e) => {
@@ -557,9 +560,9 @@ fn get_search_query_and_params(query: &RsLookupQuery) -> FnResult<(String, Optio
     match query {
         RsLookupQuery::Movie(m) => {
             if let Some(ids) = &m.ids {
-                if let Some(id_str) = ids.imdb.as_ref().map(|u| format!("imdb:{}", u))
-                    .or(ids.tmdb.map(|s| format!("tmdb:{}", s)))
-                    .or(ids.tvdb.map(|u| format!("tvdb:{}", u))) {
+                if let Some(id_str) = ids.imdb().map(|u| format!("imdb:{}", u))
+                    .or(ids.tmdb().map(|s| format!("tmdb:{}", s)))
+                    .or(ids.tvdb().map(|u| format!("tvdb:{}", u))) {
                     return Ok((id_str, None));
                 }
             }
@@ -570,9 +573,9 @@ fn get_search_query_and_params(query: &RsLookupQuery) -> FnResult<(String, Optio
         RsLookupQuery::Episode(e) => {
             let ep_num = e.number.unwrap_or(1);
             if let Some(ids) = &e.ids {
-                if let Some(id_str) = ids.imdb.as_ref().map(|u| format!("imdb:{}", u))
-                    .or(ids.tmdb.map(|s| format!("tmdb:{}", s)))
-                    .or(ids.tvdb.map(|u| format!("tvdb:{}", u))) {
+                if let Some(id_str) = ids.imdb().map(|u| format!("imdb:{}", u))
+                    .or(ids.tmdb().map(|s| format!("tmdb:{}", s)))
+                    .or(ids.tvdb().map(|u| format!("tvdb:{}", u))) {
                     return Ok((id_str, Some((e.season, Some(ep_num)))));
                 }
             }
@@ -583,9 +586,9 @@ fn get_search_query_and_params(query: &RsLookupQuery) -> FnResult<(String, Optio
         },
         RsLookupQuery::SerieSeason(s) => {
             if let Some(ids) = &s.ids {
-                if let Some(id_str) = ids.imdb.as_ref().map(|u| format!("imdb:{}", u))
-                    .or(ids.tmdb.map(|s| format!("tmdb:{}", s)))
-                    .or(ids.tvdb.map(|u| format!("tvdb:{}", u))) {
+                if let Some(id_str) = ids.imdb().map(|u| format!("imdb:{}", u))
+                    .or(ids.tmdb().map(|s| format!("tmdb:{}", s)))
+                    .or(ids.tvdb().map(|u| format!("tvdb:{}", u))) {
                     return Ok((id_str, Some((s.name.as_deref().and_then(|n| n.parse().ok()).unwrap_or(1), None))));
                 }
             }
