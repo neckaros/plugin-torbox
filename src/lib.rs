@@ -198,7 +198,7 @@ struct Torrent {
     //last_known_seeders: u32,
     //last_known_peers: u32,
     size: i64,
-    //tracker: String,
+    tracker: Option<String>,
     //categories: Vec<String>,
     //files: u32,
     //#[serde(rename = "type")]
@@ -213,7 +213,7 @@ struct Torrent {
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(
-        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 10, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
+        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 11, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
     ))
 }
 
@@ -571,6 +571,7 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
                 other => other,
             }),
             size: Some(t.size.max(0) as u64),
+            referer: t.tracker.clone(),
             ..Default::default()
         };
         // TODO: Set resolution, codec from quality if parsed
