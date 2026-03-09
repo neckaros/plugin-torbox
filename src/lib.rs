@@ -213,7 +213,7 @@ struct Torrent {
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(
-        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 8, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
+        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 9, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
     ))
 }
 
@@ -483,7 +483,14 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
         }
         url
     } else {
-        format!("https://search-api.torbox.app/v1/search?query={}&limit=20", encode(&search_query))
+        let mut url = format!("https://search-api.torbox.app/v1/search?query={}&limit=20", encode(&search_query));
+        if let Some((season, episode)) = season_episode {
+            url.push_str(&format!("&season={}", season));
+            if let Some(ep) = episode {
+                url.push_str(&format!("&episode={}", ep));
+            }
+        }
+        url
     };
 
     let req = HttpRequest {
@@ -508,7 +515,28 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
     }
 
     let mut requests = Vec::new();
-    for t in response.data.unwrap().torrents {
+    let torrents = response.data.unwrap().torrents;
+    let filtered_torrents: Vec<&Torrent> = if let Some((season, episode)) = season_episode {
+        torrents.iter().filter(|t| {
+            let season_match = match &t.title_parsed_data.season {
+                Some(U32OrArray::Single(s)) => *s == season,
+                Some(U32OrArray::Array(vs)) => vs.contains(&season),
+                None => false,
+            };
+            let episode_match = match episode {
+                Some(ep) => match &t.title_parsed_data.episode {
+                    Some(U32OrArray::Single(e)) => *e == ep,
+                    Some(U32OrArray::Array(vs)) => vs.contains(&ep),
+                    None => false,
+                },
+                None => true,
+            };
+            season_match && episode_match
+        }).collect()
+    } else {
+        torrents.iter().collect()
+    };
+    for t in filtered_torrents {
         let magnet = t.magnet.clone().unwrap_or_else(|| {
             format!("magnet:?xt=urn:btih:{}&dn={}", t.hash, encode(&t.title))
         });
@@ -582,7 +610,7 @@ fn get_search_query_and_params(query: &RsLookupQuery) -> FnResult<(String, Optio
             let name = e.name.clone()
                 .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404))?;
             let base_query = format!("{} S{:02}E{:02}", name, e.season, ep_num);
-            Ok((base_query, None))
+            Ok((base_query, Some((e.season, Some(ep_num)))))
         },
         RsLookupQuery::SerieSeason(s) => {
             if let Some(ids) = &s.ids {
