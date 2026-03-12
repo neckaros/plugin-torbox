@@ -213,7 +213,7 @@ struct Torrent {
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(
-        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 12, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
+        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 13, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
     ))
 }
 
@@ -292,6 +292,19 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
         let raw_hash = extract_btih_hash(&request.request.url)
             .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("Invalid magnet link: no BTIH hash found"), 400))?;
         let canonical_hash = get_canonical_hash(&raw_hash)?;
+
+        // Try local cache first (avoids search_my_torrents + createtorrent API calls)
+        if let Some((cached_id, file)) = try_cached_torrent(token, &canonical_hash, &request.request.selected_file) {
+            log!(LogLevel::Info, "Using cached torrent_id={} for hash {}", cached_id, canonical_hash);
+            let mut new_request = request.request.clone();
+            new_request.url = format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", cached_id, file.id);
+            new_request.status = RsRequestStatus::FinalPublic;
+            new_request.permanent = true;
+            new_request.mime = Some(file.mimetype.clone());
+            new_request.filename = Some(file.name.clone());
+            return Ok(Json(new_request));
+        }
+
         log!(LogLevel::Info, "looking for existing hash {:?}\n", canonical_hash );
         let existing = match search_my_torrents(token, &canonical_hash, 500, None)? {
             Some(value) => Some(value),
@@ -301,6 +314,7 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
         log!(LogLevel::Debug, "In {:?}\n\n", existing );
 
         if let Some(t) = existing {
+            set_cached_torrent_id(&canonical_hash, t.id as i32);
             let my_torrent_files = t.files.unwrap_or_default();
             if my_torrent_files.len() == 1 {
                 let file = &my_torrent_files[0];
@@ -310,6 +324,7 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
                 new_request.status = RsRequestStatus::FinalPublic;
                 new_request.permanent = true;
                 new_request.mime = Some(file.mimetype.clone());
+                new_request.filename = Some(file.name.clone());
                 return Ok(Json(new_request));
             } else if let Some(file) = my_torrent_files.iter().find(|f| { f.short_name == request.request.selected_file.clone().unwrap_or_default() || f.name == request.request.selected_file.clone().unwrap_or_default() }) {
                 log!(LogLevel::Info, "File already in list: {}", file.name);
@@ -318,6 +333,7 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
                 new_request.status = RsRequestStatus::FinalPublic;
                 new_request.permanent = true;
                 new_request.mime = Some(file.mimetype.clone());
+                new_request.filename = Some(file.name.clone());
                 return Ok(Json(new_request));
             }
             log!(LogLevel::Warn, "Torrent found in list (id={}) but could not match selected_file {:?} among {} files", t.id, request.request.selected_file, my_torrent_files.len());
@@ -727,6 +743,53 @@ fn get_canonical_hash(raw_hash: &str) -> FnResult<String> {
     Ok(hash)
 }
 
+// --- Local var cache: hash → torrent_id ---
+
+fn set_cached_torrent_id(canonical_hash: &str, torrent_id: i32) {
+    let key = format!("torrent:{}", canonical_hash);
+    let _ = var::set(&key, torrent_id.to_string());
+}
+
+fn get_cached_torrent_id(canonical_hash: &str) -> Option<i32> {
+    let key = format!("torrent:{}", canonical_hash);
+    var::get::<String>(&key).ok()?.and_then(|s| s.parse().ok())
+}
+
+fn clear_cached_torrent_id(canonical_hash: &str) {
+    let key = format!("torrent:{}", canonical_hash);
+    let _ = var::remove(&key);
+}
+
+fn find_matching_file<'a>(files: &'a [MyFile], selected_file: &Option<String>) -> Option<&'a MyFile> {
+    if files.len() == 1 {
+        return Some(&files[0]);
+    }
+    let selected = selected_file.as_deref().unwrap_or_default();
+    files.iter().find(|f| f.short_name == selected || f.name == selected)
+}
+
+fn try_cached_torrent(token: &str, canonical_hash: &str, selected_file: &Option<String>) -> Option<(i32, MyFile)> {
+    let cached_id = get_cached_torrent_id(canonical_hash)?;
+    log!(LogLevel::Info, "Cache hit for hash {}, torrent_id={}", canonical_hash, cached_id);
+    match get_my_torrent(token, cached_id) {
+        Ok(t) => {
+            let files = t.files.unwrap_or_default();
+            match find_matching_file(&files, selected_file) {
+                Some(file) => Some((cached_id, file.clone())),
+                None => {
+                    log!(LogLevel::Warn, "Cache hit (id={}) but no matching file for {:?}", cached_id, selected_file);
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            log!(LogLevel::Warn, "Cache stale for {}: {:?}, clearing", canonical_hash, e);
+            clear_cached_torrent_id(canonical_hash);
+            None
+        }
+    }
+}
+
 fn check_instant_internal(request: &RsRequest, token: &str) -> FnResult<Option<TorrentInfo>> {
     let raw_hash = extract_btih_hash(&request.url)
         .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("Invalid magnet link: no BTIH hash found"), 400))?;
@@ -823,6 +886,37 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
         return Err(WithReturnCode(extism_pdk::Error::msg("No files found in torrent"), 404));
     }
 
+    // Try local cache first to skip createtorrent
+    if let Some(raw_hash) = extract_btih_hash(&request.url) {
+        if let Ok(canonical_hash) = get_canonical_hash(&raw_hash) {
+            if let Some((cached_id, file)) = try_cached_torrent(token, &canonical_hash, &request.selected_file) {
+                log!(LogLevel::Info, "get_file_download_url: using cached torrent_id={}", cached_id);
+                if permanent {
+                    return Ok((format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", cached_id, file.id), file));
+                }
+                // For non-permanent, request download link
+                let mut headers: BTreeMap<String, String> = BTreeMap::new();
+                headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+                let dl_req = HttpRequest {
+                    url: format!("https://api.torbox.app/v1/api/torrents/requestdl?token={}&redirect=false&torrent_id={}&file_id={}", token, cached_id, file.id),
+                    headers,
+                    method: Some("GET".into()),
+                };
+                if let Ok(dl_res) = http::request::<()>(&dl_req, None) {
+                    if dl_res.status_code() == 200 {
+                        if let Ok(dl_response) = dl_res.json::<DownloadLinkResponse>() {
+                            if dl_response.error.is_none() {
+                                return Ok((dl_response.data, file));
+                            }
+                        }
+                    }
+                }
+                // If requestdl failed, fall through to createtorrent
+                log!(LogLevel::Warn, "Cache hit but requestdl failed, falling through to createtorrent");
+            }
+        }
+    }
+
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     headers.insert("Authorization".to_string(), format!("Bearer {}", token));
 
@@ -855,6 +949,13 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
     }
 
     let torrent_id = create_response.data.torrent_id;
+
+    // Cache the newly created torrent
+    if let Some(raw_hash) = extract_btih_hash(&request.url) {
+        if let Ok(canonical_hash) = get_canonical_hash(&raw_hash) {
+            set_cached_torrent_id(&canonical_hash, torrent_id);
+        }
+    }
 
 
     let my_torrent = get_my_torrent(token, torrent_id)?;
@@ -926,7 +1027,16 @@ fn create_torrent_for_download(magnet_url: &str, token: &str) -> FnResult<i32> {
         return Err(WithReturnCode(extism_pdk::Error::msg(err_msg), 500));
     }
 
-    Ok(create_response.data.torrent_id)
+    let torrent_id = create_response.data.torrent_id;
+
+    // Cache the newly created torrent
+    if let Some(raw_hash) = extract_btih_hash(magnet_url) {
+        if let Ok(canonical_hash) = get_canonical_hash(&raw_hash) {
+            set_cached_torrent_id(&canonical_hash, torrent_id);
+        }
+    }
+
+    Ok(torrent_id)
 }
 
 fn is_not_found_message(message: &str) -> bool {
