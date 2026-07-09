@@ -1,12 +1,19 @@
-use std::collections::{BTreeMap, HashMap};
 use extism_pdk::*;
-use rs_plugin_common_interfaces::{CredentialType, CustomParamTypes, PluginInformation, PluginType, RsAudio, RsResolution, RsVideoCodec};
 use rs_plugin_common_interfaces::lookup::{RsLookupQuery, RsLookupSourceResult, RsLookupWrapper};
-use rs_plugin_common_interfaces::request::{RsRequest, RsRequestFiles, RsRequestPluginRequest, RsRequestStatus, RsProcessingActionRequest, RsRequestAddResponse, RsProcessingProgress, RsProcessingStatus};
+use rs_plugin_common_interfaces::request::{
+    RsProcessingActionRequest, RsProcessingProgress, RsProcessingStatus, RsRequest,
+    RsRequestAddResponse, RsRequestFiles, RsRequestPluginRequest, RsRequestStatus,
+};
+use rs_plugin_common_interfaces::{
+    CredentialType, CustomParamTypes, PluginInformation, PluginType, RsAudio, RsResolution,
+    RsVideoCodec,
+};
 use serde::Deserialize;
+use std::collections::{BTreeMap, HashMap};
 use urlencoding::encode;
 
-
+const TORBOX_TORRENT_REQUESTDL: &str = "https://api.torbox.app/v1/api/torrents/requestdl";
+const TORBOX_USENET_REQUESTDL: &str = "https://api.torbox.app/v1/api/usenet/requestdl";
 
 #[derive(Deserialize, Debug)]
 struct ApiResponse {
@@ -24,7 +31,6 @@ struct TorrentInfo {
     files: Option<Vec<FileInfo>>,
 }
 
-
 #[derive(Deserialize, Debug, Clone)]
 struct FileInfo {
     //name: String,
@@ -33,7 +39,6 @@ struct FileInfo {
     short_name: String,
     mimetype: String,
 }
-
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MyTorrentsResponse {
@@ -50,7 +55,6 @@ pub struct MyTorrentResponse {
     pub detail: String,
     pub data: MyTorrent,
 }
-
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MyTorrent {
@@ -108,7 +112,6 @@ pub struct MyFile {
     pub opensubtitles_hash: Option<String>,
 }
 
-
 /*
 #[derive(Serialize)]
 struct CreateBody {
@@ -126,6 +129,17 @@ struct CreateTorrentResponse {
 #[derive(Deserialize)]
 struct CreateData {
     torrent_id: i32,
+}
+
+#[derive(Deserialize)]
+struct CreateUsenetResponse {
+    error: Option<String>,
+    data: CreateUsenetData,
+}
+
+#[derive(Deserialize)]
+struct CreateUsenetData {
+    usenetdownload_id: i32,
 }
 
 #[derive(Deserialize)]
@@ -209,12 +223,18 @@ struct Torrent {
     cached: bool,
 }
 
-
 #[plugin_fn]
 pub fn infos() -> FnResult<Json<PluginInformation>> {
-    Ok(Json(
-        PluginInformation { name: "torbox".into(), capabilities: vec![PluginType::Lookup, PluginType::Request], version: 13, publisher: "neckaros".into(), repo: Some("https://github.com/neckaros/plugin-torbox".to_string()), description: "search and download torrent or usened from Torbox".into(), credential_kind: Some(CredentialType::Token), ..Default::default() }
-    ))
+    Ok(Json(PluginInformation {
+        name: "torbox".into(),
+        capabilities: vec![PluginType::Lookup, PluginType::Request],
+        version: 14,
+        publisher: "neckaros".into(),
+        repo: Some("https://github.com/neckaros/plugin-torbox".to_string()),
+        description: "search and download torrent or usenet from Torbox".into(),
+        credential_kind: Some(CredentialType::Token),
+        ..Default::default()
+    }))
 }
 
 #[plugin_fn]
@@ -224,12 +244,23 @@ pub fn check_instant(Json(request): Json<RsRequestPluginRequest>) -> FnResult<Js
         return Ok(Json(true));
     }
 
+    if is_nzb_request(&request.request) {
+        let token = request
+            .credential
+            .and_then(|c| c.password)
+            .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
+
+        let result = check_usenet_instant_internal(&request.request, &token)?;
+        return Ok(Json(result.is_some()));
+    }
+
     // Only magnet links can be checked for instant availability
     if !request.request.url.starts_with("magnet:") {
         return Ok(Json(false));
     }
 
-    let token = request.credential
+    let token = request
+        .credential
         .and_then(|c| c.password)
         .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
 
@@ -244,58 +275,117 @@ pub fn process(Json(request): Json<RsRequestPluginRequest>) -> FnResult<Json<RsR
     if request.request.url.starts_with("magnet:") {
         if let Some(credentials) = request.credential {
             if let Some(password) = credentials.password {
-               return handle_magnet_request(&request.request, &password);
+                return handle_magnet_request(&request.request, &password);
             } else {
-            return Err(WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401));
+                return Err(WithReturnCode::new(
+                    extism_pdk::Error::msg("No token provided"),
+                    401,
+                ));
             }
         } else {
-            return Err(WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401));
+            return Err(WithReturnCode::new(
+                extism_pdk::Error::msg("No token provided"),
+                401,
+            ));
         }
-
+    } else if is_nzb_request(&request.request) {
+        if let Some(credentials) = request.credential {
+            if let Some(password) = credentials.password {
+                return handle_usenet_request(&request.request, &password);
+            } else {
+                return Err(WithReturnCode::new(
+                    extism_pdk::Error::msg("No token provided"),
+                    401,
+                ));
+            }
+        } else {
+            return Err(WithReturnCode::new(
+                extism_pdk::Error::msg("No token provided"),
+                401,
+            ));
+        }
     } else if request.request.url.starts_with("torbox://") {
-        let token = &request.credential.and_then(|c| c.password)
+        let token = &request
+            .credential
+            .and_then(|c| c.password)
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
         let mut new_request = request.request.clone();
-        new_request.url = new_request.url.replacen("torbox://", "https://", 1).replace("_TOKEN_", token);
+        new_request.url = new_request
+            .url
+            .replacen("torbox://", "https://", 1)
+            .replace("_TOKEN_", token);
         new_request.status = RsRequestStatus::FinalPublic; // Direct download link
-        new_request.permanent = false;      
+        new_request.permanent = false;
         return Ok(Json(new_request));
     }
 
-    Err(WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404))
+    Err(WithReturnCode::new(
+        extism_pdk::Error::msg("Not supported"),
+        404,
+    ))
 }
-
 
 #[plugin_fn]
 pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResult<Json<RsRequest>> {
     if request.request.url.starts_with("magnet") {
-        let token = &request.credential.and_then(|c| c.password)
+        let token = &request
+            .credential
+            .and_then(|c| c.password)
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
 
-        let torrent_info = check_instant_internal(&request.request, token)?
-            .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not available for instant download"), 404))?;
+        let torrent_info = check_instant_internal(&request.request, token)?.ok_or_else(|| {
+            WithReturnCode::new(
+                extism_pdk::Error::msg("Not available for instant download"),
+                404,
+            )
+        })?;
 
-        log!(LogLevel::Debug, "Torrent Info {:?}\n\n", torrent_info );
-        if torrent_info.files.as_ref().map(|f| f.len()).unwrap_or(0) > 1 && request.request.selected_file.is_none() {
+        log!(LogLevel::Debug, "Torrent Info {:?}\n\n", torrent_info);
+        if torrent_info.files.as_ref().map(|f| f.len()).unwrap_or(0) > 1
+            && request.request.selected_file.is_none()
+        {
             let mut result = request.request.clone();
             result.status = RsRequestStatus::NeedFileSelection;
             result.permanent = false;
-            result.files = Some(torrent_info.files.unwrap_or_default().into_iter().map(|l| {
-                let mut file = RsRequestFiles { name: l.short_name, size: l.size.max(0) as u64, mime: Some(l.mimetype), ..Default::default()};
-                file.parse_filename();
-                file
-            }).collect());
+            result.files = Some(
+                torrent_info
+                    .files
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|l| {
+                        let mut file = RsRequestFiles {
+                            name: l.short_name,
+                            size: l.size.max(0) as u64,
+                            mime: Some(l.mimetype),
+                            ..Default::default()
+                        };
+                        file.parse_filename();
+                        file
+                    })
+                    .collect(),
+            );
             return Ok(Json(result));
         }
 
         // Check if already downloaded and cached
-        let raw_hash = extract_btih_hash(&request.request.url)
-            .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("Invalid magnet link: no BTIH hash found"), 400))?;
+        let raw_hash = extract_btih_hash(&request.request.url).ok_or_else(|| {
+            WithReturnCode(
+                extism_pdk::Error::msg("Invalid magnet link: no BTIH hash found"),
+                400,
+            )
+        })?;
         let canonical_hash = get_canonical_hash(&raw_hash)?;
 
         // Try local cache first (avoids search_my_torrents + createtorrent API calls)
-        if let Some((cached_id, file)) = try_cached_torrent(token, &canonical_hash, &request.request.selected_file) {
-            log!(LogLevel::Info, "Using cached torrent_id={} for hash {}", cached_id, canonical_hash);
+        if let Some((cached_id, file)) =
+            try_cached_torrent(token, &canonical_hash, &request.request.selected_file)
+        {
+            log!(
+                LogLevel::Info,
+                "Using cached torrent_id={} for hash {}",
+                cached_id,
+                canonical_hash
+            );
             let mut new_request = request.request.clone();
             new_request.url = format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", cached_id, file.id);
             new_request.status = RsRequestStatus::FinalPublic;
@@ -305,13 +395,17 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
             return Ok(Json(new_request));
         }
 
-        log!(LogLevel::Info, "looking for existing hash {:?}\n", canonical_hash );
+        log!(
+            LogLevel::Info,
+            "looking for existing hash {:?}\n",
+            canonical_hash
+        );
         let existing = match search_my_torrents(token, &canonical_hash, 500, None)? {
             Some(value) => Some(value),
             None => search_my_torrents(token, &canonical_hash, 500, Some(true))?,
         };
 
-        log!(LogLevel::Debug, "In {:?}\n\n", existing );
+        log!(LogLevel::Debug, "In {:?}\n\n", existing);
 
         if let Some(t) = existing {
             set_cached_torrent_id(&canonical_hash, t.id as i32);
@@ -326,7 +420,10 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
                 new_request.mime = Some(file.mimetype.clone());
                 new_request.filename = Some(file.name.clone());
                 return Ok(Json(new_request));
-            } else if let Some(file) = my_torrent_files.iter().find(|f| { f.short_name == request.request.selected_file.clone().unwrap_or_default() || f.name == request.request.selected_file.clone().unwrap_or_default() }) {
+            } else if let Some(file) = my_torrent_files.iter().find(|f| {
+                f.short_name == request.request.selected_file.clone().unwrap_or_default()
+                    || f.name == request.request.selected_file.clone().unwrap_or_default()
+            }) {
                 log!(LogLevel::Info, "File already in list: {}", file.name);
                 let mut new_request = request.request.clone();
                 new_request.url = format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", t.id, file.id);
@@ -339,8 +436,11 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
             log!(LogLevel::Warn, "Torrent found in list (id={}) but could not match selected_file {:?} among {} files", t.id, request.request.selected_file, my_torrent_files.len());
         }
 
-
-        log!(LogLevel::Info, "Getting file download link by adding it to your torrents {:?}\n", canonical_hash );
+        log!(
+            LogLevel::Info,
+            "Getting file download link by adding it to your torrents {:?}\n",
+            canonical_hash
+        );
         let (url, file) = get_file_download_url(&request.request, &torrent_info, token, true)?;
         let mut final_request = request.request.clone();
         final_request.url = url;
@@ -349,119 +449,304 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
         final_request.mime = Some(file.mimetype.clone());
         final_request.filename = Some(file.name.clone());
         Ok(Json(final_request))
-    } else if request.request.url.starts_with("https://api.torbox.app/v1/api/torrents/requestdl") {
-        let token = &request.credential.and_then(|c| c.password)
+    } else if is_nzb_request(&request.request) {
+        let token = &request
+            .credential
+            .and_then(|c| c.password)
+            .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
+
+        let usenet_info =
+            check_usenet_instant_internal(&request.request, token)?.ok_or_else(|| {
+                WithReturnCode::new(
+                    extism_pdk::Error::msg("Not available for instant download"),
+                    404,
+                )
+            })?;
+
+        if usenet_info.files.as_ref().map(|f| f.len()).unwrap_or(0) > 1
+            && request.request.selected_file.is_none()
+        {
+            let mut result = request.request.clone();
+            result.status = RsRequestStatus::NeedFileSelection;
+            result.permanent = false;
+            result.files = Some(
+                usenet_info
+                    .files
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|l| {
+                        let mut file = RsRequestFiles {
+                            name: l.short_name,
+                            size: l.size.max(0) as u64,
+                            mime: Some(l.mimetype),
+                            ..Default::default()
+                        };
+                        file.parse_filename();
+                        file
+                    })
+                    .collect(),
+            );
+            return Ok(Json(result));
+        }
+
+        let usenet_hash = get_usenet_hash(&request.request);
+
+        if let Some((cached_id, file)) =
+            try_cached_usenet(token, &usenet_hash, &request.request.selected_file)
+        {
+            log!(
+                LogLevel::Info,
+                "Using cached usenet_id={} for hash {}",
+                cached_id,
+                usenet_hash
+            );
+            let mut new_request = request.request.clone();
+            new_request.url = format!("torbox://api.torbox.app/v1/api/usenet/requestdl?token=_TOKEN_&redirect=true&usenet_id={}&file_id={}", cached_id, file.id);
+            new_request.status = RsRequestStatus::FinalPublic;
+            new_request.permanent = true;
+            new_request.mime = Some(file.mimetype.clone());
+            new_request.filename = Some(file.name.clone());
+            return Ok(Json(new_request));
+        }
+
+        let existing = match search_my_usenet(token, &usenet_hash, 500, None)? {
+            Some(value) => Some(value),
+            None => search_my_usenet(token, &usenet_hash, 500, Some(true))?,
+        };
+
+        if let Some(u) = existing {
+            set_cached_usenet_id(&usenet_hash, u.id as i32);
+            let my_usenet_files = u.files.unwrap_or_default();
+            if my_usenet_files.len() == 1 {
+                let file = &my_usenet_files[0];
+                let mut new_request = request.request.clone();
+                new_request.url = format!("torbox://api.torbox.app/v1/api/usenet/requestdl?token=_TOKEN_&redirect=true&usenet_id={}&file_id={}", u.id, file.id);
+                new_request.status = RsRequestStatus::FinalPublic;
+                new_request.permanent = true;
+                new_request.mime = Some(file.mimetype.clone());
+                new_request.filename = Some(file.name.clone());
+                return Ok(Json(new_request));
+            } else if let Some(file) = my_usenet_files.iter().find(|f| {
+                f.short_name == request.request.selected_file.clone().unwrap_or_default()
+                    || f.name == request.request.selected_file.clone().unwrap_or_default()
+            }) {
+                let mut new_request = request.request.clone();
+                new_request.url = format!("torbox://api.torbox.app/v1/api/usenet/requestdl?token=_TOKEN_&redirect=true&usenet_id={}&file_id={}", u.id, file.id);
+                new_request.status = RsRequestStatus::FinalPublic;
+                new_request.permanent = true;
+                new_request.mime = Some(file.mimetype.clone());
+                new_request.filename = Some(file.name.clone());
+                return Ok(Json(new_request));
+            }
+            log!(LogLevel::Warn, "Usenet download found in list (id={}) but could not match selected_file {:?} among {} files", u.id, request.request.selected_file, my_usenet_files.len());
+        }
+
+        let (url, file) = get_usenet_file_download_url(&request.request, token, true)?;
+        let mut final_request = request.request.clone();
+        final_request.url = url;
+        final_request.status = RsRequestStatus::FinalPublic;
+        final_request.permanent = true;
+        final_request.mime = Some(file.mimetype.clone());
+        final_request.filename = Some(file.name.clone());
+        Ok(Json(final_request))
+    } else if request.request.url.starts_with(TORBOX_TORRENT_REQUESTDL)
+        || request.request.url.starts_with(TORBOX_USENET_REQUESTDL)
+    {
+        let token = &request
+            .credential
+            .and_then(|c| c.password)
             .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
         let mut new_request = request.request.clone();
-        new_request.url = request.request.url.replacen("https://", "torbox://", 1).replace(token, "_TOKEN_");
+        new_request.url = request
+            .request
+            .url
+            .replacen("https://", "torbox://", 1)
+            .replace(token, "_TOKEN_");
         new_request.status = RsRequestStatus::FinalPublic; // Direct download link
-        new_request.permanent = true;      
+        new_request.permanent = true;
         return Ok(Json(new_request));
     } else {
-        Err(WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404))
+        Err(WithReturnCode::new(
+            extism_pdk::Error::msg("Not supported"),
+            404,
+        ))
     }
 }
 
 #[plugin_fn]
-pub fn request_add(Json(request): Json<RsRequestPluginRequest>) -> FnResult<Json<RsRequestAddResponse>> {
-    // Only supports magnet links
-    if !request.request.url.starts_with("magnet:") {
-        return Err(WithReturnCode::new(extism_pdk::Error::msg("Only magnet links are supported for request_add"), 400));
-    }
-
-    let token = request.credential
+pub fn request_add(
+    Json(request): Json<RsRequestPluginRequest>,
+) -> FnResult<Json<RsRequestAddResponse>> {
+    let token = request
+        .credential
         .and_then(|c| c.password)
         .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
 
-    let torrent_id = create_torrent_for_download(&request.request.url, &token)?;
+    if request.request.url.starts_with("magnet:") {
+        let torrent_id = create_torrent_for_download(&request.request.url, &token)?;
 
-    // Get initial status
-    let torrent = get_my_torrent(&token, torrent_id)?;
-    let status = map_download_state_to_status(torrent.download_state.as_deref(), torrent.cached);
+        // Get initial status
+        let torrent = get_my_torrent(&token, torrent_id)?;
+        let status =
+            map_download_state_to_status(torrent.download_state.as_deref(), torrent.cached);
 
-    // Return relative ETA in milliseconds (host will convert to absolute timestamp)
-    let eta = torrent.eta.filter(|&e| e > 0).map(|e| e * 1000);
+        // Return relative ETA in milliseconds (host will convert to absolute timestamp)
+        let eta = torrent.eta.filter(|&e| e > 0).map(|e| e * 1000);
 
-    Ok(Json(RsRequestAddResponse {
-        processing_id: torrent_id.to_string(),
-        status,
-        eta,
-    }))
+        return Ok(Json(RsRequestAddResponse {
+            processing_id: torrent_id.to_string(),
+            status,
+            eta,
+        }));
+    }
+
+    if is_nzb_request(&request.request) {
+        let usenet_id = create_usenet_for_download(&request.request.url, &token, false)?;
+
+        let usenet = get_my_usenet(&token, usenet_id)?;
+        let status = map_download_state_to_status(usenet.download_state.as_deref(), usenet.cached);
+
+        let eta = usenet.eta.filter(|&e| e > 0).map(|e| e * 1000);
+
+        return Ok(Json(RsRequestAddResponse {
+            processing_id: format!("usenet:{}", usenet_id),
+            status,
+            eta,
+        }));
+    }
+
+    Err(WithReturnCode::new(
+        extism_pdk::Error::msg("Only magnet and NZB links are supported for request_add"),
+        400,
+    ))
 }
 
 #[plugin_fn]
-pub fn get_progress(Json(request): Json<RsProcessingActionRequest>) -> FnResult<Json<RsProcessingProgress>> {
-    let token = request.credential
+pub fn get_progress(
+    Json(request): Json<RsProcessingActionRequest>,
+) -> FnResult<Json<RsProcessingProgress>> {
+    let token = request
+        .credential
         .and_then(|c| c.password)
         .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
 
-    let torrent_id: i32 = request.processing_id.parse()
-        .map_err(|_| WithReturnCode::new(extism_pdk::Error::msg("Invalid processing_id"), 400))?;
+    let processing_id = parse_processing_id(&request.processing_id)?;
 
-    let torrent = get_my_torrent(&token, torrent_id)?;
+    match processing_id {
+        ProcessingId::Torrent(torrent_id) => {
+            let torrent = get_my_torrent(&token, torrent_id)?;
 
-    let status = map_download_state_to_status(torrent.download_state.as_deref(), torrent.cached);
+            let status =
+                map_download_state_to_status(torrent.download_state.as_deref(), torrent.cached);
 
-    // Convert progress from 0.0-1.0 to 0-100
-    let progress = (torrent.progress.unwrap_or(0.0) * 100.0) as u32;
+            // Convert progress from 0.0-1.0 to 0-100
+            let progress = (torrent.progress.unwrap_or(0.0) * 100.0) as u32;
 
-    // Return relative ETA in milliseconds (host will convert to absolute timestamp)
-    let eta = torrent.eta.filter(|&e| e > 0).map(|e| e * 1000);
+            // Return relative ETA in milliseconds (host will convert to absolute timestamp)
+            let eta = torrent.eta.filter(|&e| e > 0).map(|e| e * 1000);
 
-    // If finished, construct the final request with download URL
-    let final_request = if status == RsProcessingStatus::Finished {
-        let selected_file = request.params.as_ref().and_then(|p| p.get("selected_file")).and_then(|s| match s {
-            CustomParamTypes::Text(v) | CustomParamTypes::Url(v) => v.as_deref(),
-            _ => None,
-        });
-        match construct_final_request(&torrent, selected_file) {
-            Ok(req) => Some(Box::new(req)),
-            Err(e) => {
-                log!(LogLevel::Warn, "Failed to construct final request: {:?}", e);
+            // If finished, construct the final request with download URL
+            let final_request = if status == RsProcessingStatus::Finished {
+                let selected_file = request
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("selected_file"))
+                    .and_then(|s| match s {
+                        CustomParamTypes::Text(v) | CustomParamTypes::Url(v) => v.as_deref(),
+                        _ => None,
+                    });
+                match construct_final_request(&torrent, selected_file) {
+                    Ok(req) => Some(Box::new(req)),
+                    Err(e) => {
+                        log!(LogLevel::Warn, "Failed to construct final request: {:?}", e);
+                        None
+                    }
+                }
+            } else {
                 None
-            }
-        }
-    } else {
-        None
-    };
+            };
 
-    Ok(Json(RsProcessingProgress {
-        processing_id: request.processing_id,
-        progress,
-        status,
-        error: None,
-        eta,
-        request: final_request,
-    }))
+            Ok(Json(RsProcessingProgress {
+                processing_id: request.processing_id,
+                progress,
+                status,
+                error: None,
+                eta,
+                request: final_request,
+            }))
+        }
+        ProcessingId::Usenet(usenet_id) => {
+            let usenet = get_my_usenet(&token, usenet_id)?;
+
+            let status =
+                map_download_state_to_status(usenet.download_state.as_deref(), usenet.cached);
+            let progress = (usenet.progress.unwrap_or(0.0) * 100.0) as u32;
+            let eta = usenet.eta.filter(|&e| e > 0).map(|e| e * 1000);
+
+            let final_request = if status == RsProcessingStatus::Finished {
+                let selected_file = request
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("selected_file"))
+                    .and_then(|s| match s {
+                        CustomParamTypes::Text(v) | CustomParamTypes::Url(v) => v.as_deref(),
+                        _ => None,
+                    });
+                match construct_final_usenet_request(&usenet, selected_file) {
+                    Ok(req) => Some(Box::new(req)),
+                    Err(e) => {
+                        log!(
+                            LogLevel::Warn,
+                            "Failed to construct final usenet request: {:?}",
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            Ok(Json(RsProcessingProgress {
+                processing_id: request.processing_id,
+                progress,
+                status,
+                error: None,
+                eta,
+                request: final_request,
+            }))
+        }
+    }
 }
 
 #[plugin_fn]
 pub fn pause(Json(request): Json<RsProcessingActionRequest>) -> FnResult<()> {
-    let token = request.credential
+    let token = request
+        .credential
         .and_then(|c| c.password)
         .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
 
-    let torrent_id: i32 = request.processing_id.parse()
-        .map_err(|_| WithReturnCode::new(extism_pdk::Error::msg("Invalid processing_id"), 400))?;
-
-    control_torrent(&token, torrent_id, "pause")
+    match parse_processing_id(&request.processing_id)? {
+        ProcessingId::Torrent(torrent_id) => control_torrent(&token, torrent_id, "pause"),
+        ProcessingId::Usenet(usenet_id) => control_usenet(&token, usenet_id, "pause"),
+    }
 }
 
 #[plugin_fn]
 pub fn remove(Json(request): Json<RsProcessingActionRequest>) -> FnResult<()> {
-    let token = request.credential
+    let token = request
+        .credential
         .and_then(|c| c.password)
         .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("No token provided"), 401))?;
 
-    let torrent_id: i32 = request.processing_id.parse()
-        .map_err(|_| WithReturnCode::new(extism_pdk::Error::msg("Invalid processing_id"), 400))?;
-
-    control_torrent(&token, torrent_id, "delete")
+    match parse_processing_id(&request.processing_id)? {
+        ProcessingId::Torrent(torrent_id) => control_torrent(&token, torrent_id, "delete"),
+        ProcessingId::Usenet(usenet_id) => control_usenet(&token, usenet_id, "delete"),
+    }
 }
 
 #[plugin_fn]
 pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSourceResult>> {
-
     let token = if let Some(cred) = &lookup.credential {
         if let Some(pw) = &cred.password {
             pw
@@ -479,14 +764,24 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
         Ok(result) => result,
         Err(_) => return Ok(Json(RsLookupSourceResult::NotApplicable)),
     };
-    log!(LogLevel::Info, "Search query:\nfrom: {:?}\nto: {:?} / {:?}", lookup, search_query, season_episode);
+    log!(
+        LogLevel::Info,
+        "Search query:\nfrom: {:?}\nto: {:?} / {:?}",
+        lookup,
+        search_query,
+        season_episode
+    );
     if search_query.is_empty() {
         return Ok(Json(RsLookupSourceResult::NotApplicable));
     }
 
     let api_url = if search_query.contains(':') {
         let base = "https://search-api.torbox.app/torrents/".to_string();
-        let mut url = format!("{}{}?metadata=false&check_cache=true", base, encode(&search_query));
+        let mut url = format!(
+            "{}{}?metadata=false&check_cache=true",
+            base,
+            encode(&search_query)
+        );
         if let Some((season, episode)) = season_episode {
             url.push_str(&format!("&season={}", season));
             if let Some(ep) = episode {
@@ -495,7 +790,10 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
         }
         url
     } else {
-        let mut url = format!("https://search-api.torbox.app/v1/search?query={}&limit=20", encode(&search_query));
+        let mut url = format!(
+            "https://search-api.torbox.app/v1/search?query={}&limit=20",
+            encode(&search_query)
+        );
         if let Some((season, episode)) = season_episode {
             url.push_str(&format!("&season={}", season));
             if let Some(ep) = episode {
@@ -514,44 +812,67 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
     let res = http::request::<()>(&req, None)?;
 
     if res.status_code() != 200 {
-        log!(LogLevel::Error, "HTTP error ({}) {}: {}", api_url, res.status_code(), String::from_utf8_lossy(&res.body()));
+        log!(
+            LogLevel::Error,
+            "HTTP error ({}) {}: {}",
+            api_url,
+            res.status_code(),
+            String::from_utf8_lossy(&res.body())
+        );
         return Ok(Json(RsLookupSourceResult::NotFound));
     }
 
-    let response: SearchResponse = res.json()
-        .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON search parse error: {}\nBody:\n{}", e, String::from_utf8(res.body()).unwrap_or("no body".to_string()))), 500))?;
+    let response: SearchResponse = res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "JSON search parse error: {}\nBody:\n{}",
+                e,
+                String::from_utf8(res.body()).unwrap_or("no body".to_string())
+            )),
+            500,
+        )
+    })?;
 
     if response.success != true || response.data.is_none() {
-        log!(LogLevel::Error, "API error ({}): {:?}", api_url, response.error);
+        log!(
+            LogLevel::Error,
+            "API error ({}): {:?}",
+            api_url,
+            response.error
+        );
         return Ok(Json(RsLookupSourceResult::NotFound));
     }
 
     let mut requests = Vec::new();
     let torrents = response.data.unwrap().torrents;
     let filtered_torrents: Vec<&Torrent> = if let Some((season, episode)) = season_episode {
-        torrents.iter().filter(|t| {
-            let season_match = match &t.title_parsed_data.season {
-                Some(U32OrArray::Single(s)) => *s == season,
-                Some(U32OrArray::Array(vs)) => vs.contains(&season),
-                None => false,
-            };
-            let episode_match = match episode {
-                Some(ep) => match &t.title_parsed_data.episode {
-                    Some(U32OrArray::Single(e)) => *e == ep,
-                    Some(U32OrArray::Array(vs)) => vs.contains(&ep),
-                    None => true, // season pack with no episode info, allow it
-                },
-                None => true,
-            };
-            season_match && episode_match
-        }).collect()
+        torrents
+            .iter()
+            .filter(|t| {
+                let season_match = match &t.title_parsed_data.season {
+                    Some(U32OrArray::Single(s)) => *s == season,
+                    Some(U32OrArray::Array(vs)) => vs.contains(&season),
+                    None => false,
+                };
+                let episode_match = match episode {
+                    Some(ep) => match &t.title_parsed_data.episode {
+                        Some(U32OrArray::Single(e)) => *e == ep,
+                        Some(U32OrArray::Array(vs)) => vs.contains(&ep),
+                        None => true, // season pack with no episode info, allow it
+                    },
+                    None => true,
+                };
+                season_match && episode_match
+            })
+            .collect()
     } else {
         torrents.iter().collect()
     };
     for t in filtered_torrents {
-        let magnet = t.magnet.clone().unwrap_or_else(|| {
-            format!("magnet:?xt=urn:btih:{}&dn={}", t.hash, encode(&t.title))
-        });
+        let magnet = t
+            .magnet
+            .clone()
+            .unwrap_or_else(|| format!("magnet:?xt=urn:btih:{}&dn={}", t.hash, encode(&t.title)));
 
         let r = RsRequest {
             url: magnet,
@@ -570,17 +891,26 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
                 U32OrArray::Single(v) => Some(*v),
                 U32OrArray::Array(vs) => vs.first().cloned(),
             }),
-            videocodec: t.title_parsed_data.codec.as_ref().map(|a| match RsVideoCodec::from_filename(a) {
-                RsVideoCodec::Unknown => RsVideoCodec::Custom(a.clone()),
-                other => other,
-            }),
-            audio: t.title_parsed_data.audio.as_ref().map(|a| match RsAudio::from_filename(a) {
-                RsAudio::Unknown => RsAudio::Custom(a.clone()),
-                other => other,
-            }).map(|a| vec![a]),
-            resolution: t.title_parsed_data.resolution.as_ref().map(|a| match RsResolution::from_filename(a) {
-                RsResolution::Unknown => RsResolution::Custom(a.clone()),
-                other => other,
+            videocodec: t.title_parsed_data.codec.as_ref().map(
+                |a| match RsVideoCodec::from_filename(a) {
+                    RsVideoCodec::Unknown => RsVideoCodec::Custom(a.clone()),
+                    other => other,
+                },
+            ),
+            audio: t
+                .title_parsed_data
+                .audio
+                .as_ref()
+                .map(|a| match RsAudio::from_filename(a) {
+                    RsAudio::Unknown => RsAudio::Custom(a.clone()),
+                    other => other,
+                })
+                .map(|a| vec![a]),
+            resolution: t.title_parsed_data.resolution.as_ref().map(|a| {
+                match RsResolution::from_filename(a) {
+                    RsResolution::Unknown => RsResolution::Custom(a.clone()),
+                    other => other,
+                }
             }),
             size: Some(t.size.max(0) as u64),
             referer: t.tracker.clone(),
@@ -597,68 +927,109 @@ pub fn lookup(Json(lookup): Json<RsLookupWrapper>) -> FnResult<Json<RsLookupSour
     }
 }
 
-fn get_search_query_and_params(query: &RsLookupQuery) -> FnResult<(String, Option<(u32, Option<u32>)>)> {
+fn get_search_query_and_params(
+    query: &RsLookupQuery,
+) -> FnResult<(String, Option<(u32, Option<u32>)>)> {
     match query {
         RsLookupQuery::Movie(m) => {
             if let Some(ids) = &m.ids {
-                if let Some(id_str) = ids.imdb().map(|u| format!("imdb:{}", u))
+                if let Some(id_str) = ids
+                    .imdb()
+                    .map(|u| format!("imdb:{}", u))
                     .or(ids.tmdb().map(|s| format!("tmdb:{}", s)))
-                    .or(ids.tvdb().map(|u| format!("tvdb:{}", u))) {
+                    .or(ids.tvdb().map(|u| format!("tvdb:{}", u)))
+                {
                     return Ok((id_str, None));
                 }
             }
-            let name = m.name.clone()
+            let name = m
+                .name
+                .clone()
                 .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404))?;
             Ok((name, None))
-        },
+        }
         RsLookupQuery::Episode(e) => {
             let ep_num = e.number.unwrap_or(1);
             if let Some(ids) = &e.ids {
-                if let Some(id_str) = ids.imdb().map(|u| format!("imdb:{}", u))
+                if let Some(id_str) = ids
+                    .imdb()
+                    .map(|u| format!("imdb:{}", u))
                     .or(ids.tmdb().map(|s| format!("tmdb:{}", s)))
-                    .or(ids.tvdb().map(|u| format!("tvdb:{}", u))) {
+                    .or(ids.tvdb().map(|u| format!("tvdb:{}", u)))
+                {
                     return Ok((id_str, Some((e.season, Some(ep_num)))));
                 }
             }
-            let name = e.name.clone()
+            let name = e
+                .name
+                .clone()
                 .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404))?;
             let base_query = format!("{} S{:02}E{:02}", name, e.season, ep_num);
             Ok((base_query, Some((e.season, Some(ep_num)))))
-        },
+        }
         RsLookupQuery::SerieSeason(s) => {
             if let Some(ids) = &s.ids {
-                if let Some(id_str) = ids.imdb().map(|u| format!("imdb:{}", u))
+                if let Some(id_str) = ids
+                    .imdb()
+                    .map(|u| format!("imdb:{}", u))
                     .or(ids.tmdb().map(|s| format!("tmdb:{}", s)))
-                    .or(ids.tvdb().map(|u| format!("tvdb:{}", u))) {
-                    return Ok((id_str, Some((s.name.as_deref().and_then(|n| n.parse().ok()).unwrap_or(1), None))));
+                    .or(ids.tvdb().map(|u| format!("tvdb:{}", u)))
+                {
+                    return Ok((
+                        id_str,
+                        Some((
+                            s.name.as_deref().and_then(|n| n.parse().ok()).unwrap_or(1),
+                            None,
+                        )),
+                    ));
                 }
             }
-            let name = s.name.clone()
+            let name = s
+                .name
+                .clone()
                 .ok_or_else(|| WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404))?;
             Ok((format!("{} season", name), None))
-        },
-        _ => Err(WithReturnCode::new(extism_pdk::Error::msg("Not supported"), 404)),
+        }
+        _ => Err(WithReturnCode::new(
+            extism_pdk::Error::msg("Not supported"),
+            404,
+        )),
     }
 }
-
 
 fn handle_magnet_request(request: &RsRequest, password: &str) -> FnResult<Json<RsRequest>> {
     match check_instant_internal(request, password)? {
         Some(torrent_info) => {
-            if torrent_info.files.as_ref().map(|f| f.len()).unwrap_or(0) > 1 && request.selected_file.is_none() {
+            if torrent_info.files.as_ref().map(|f| f.len()).unwrap_or(0) > 1
+                && request.selected_file.is_none()
+            {
                 let mut result = request.clone();
                 result.status = RsRequestStatus::NeedFileSelection;
-                result.files = Some(torrent_info.files.unwrap_or_default().into_iter().map(|l| {
-                let mut file = RsRequestFiles { name: l.short_name, size: l.size.max(0) as u64, mime: Some(l.mimetype), ..Default::default()};
-                    file.parse_filename();
-                    file
-                }).collect());
+                result.files = Some(
+                    torrent_info
+                        .files
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|l| {
+                            let mut file = RsRequestFiles {
+                                name: l.short_name,
+                                size: l.size.max(0) as u64,
+                                mime: Some(l.mimetype),
+                                ..Default::default()
+                            };
+                            file.parse_filename();
+                            file
+                        })
+                        .collect(),
+                );
                 result.parse_subfilenames();
                 Ok(Json(result))
             } else {
                 // instant available, get file download URL
                 let (url, file) = get_file_download_url(request, &torrent_info, password, true)?;
-                let download_url = url.replace("torbox://", "https://").replace("_TOKEN_", password);
+                let download_url = url
+                    .replace("torbox://", "https://")
+                    .replace("_TOKEN_", password);
                 let mut new_request = request.clone();
                 new_request.status = RsRequestStatus::FinalPublic;
                 new_request.url = download_url;
@@ -667,7 +1038,7 @@ fn handle_magnet_request(request: &RsRequest, password: &str) -> FnResult<Json<R
                 new_request.permanent = false;
                 Ok(Json(new_request))
             }
-        },
+        }
         None => {
             // Not available for instant - mark as requiring add to torrent list
             let mut result = request.clone();
@@ -677,7 +1048,92 @@ fn handle_magnet_request(request: &RsRequest, password: &str) -> FnResult<Json<R
     }
 }
 
+fn handle_usenet_request(request: &RsRequest, password: &str) -> FnResult<Json<RsRequest>> {
+    match check_usenet_instant_internal(request, password)? {
+        Some(usenet_info) => {
+            if usenet_info.files.as_ref().map(|f| f.len()).unwrap_or(0) > 1
+                && request.selected_file.is_none()
+            {
+                let mut result = request.clone();
+                result.status = RsRequestStatus::NeedFileSelection;
+                result.files = Some(
+                    usenet_info
+                        .files
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|l| {
+                            let mut file = RsRequestFiles {
+                                name: l.short_name,
+                                size: l.size.max(0) as u64,
+                                mime: Some(l.mimetype),
+                                ..Default::default()
+                            };
+                            file.parse_filename();
+                            file
+                        })
+                        .collect(),
+                );
+                result.parse_subfilenames();
+                Ok(Json(result))
+            } else {
+                let (url, file) = get_usenet_file_download_url(request, password, true)?;
+                let download_url = url
+                    .replace("torbox://", "https://")
+                    .replace("_TOKEN_", password);
+                let mut new_request = request.clone();
+                new_request.status = RsRequestStatus::FinalPublic;
+                new_request.url = download_url;
+                new_request.mime = Some(file.mimetype.clone());
+                new_request.filename = Some(file.name.clone());
+                new_request.permanent = false;
+                Ok(Json(new_request))
+            }
+        }
+        None => {
+            let mut result = request.clone();
+            result.status = RsRequestStatus::RequireAdd;
+            Ok(Json(result))
+        }
+    }
+}
 
+fn is_nzb_request(request: &RsRequest) -> bool {
+    request
+        .mime
+        .as_ref()
+        .map(|mime| mime.to_ascii_lowercase().contains("nzb"))
+        .unwrap_or(false)
+        || request
+            .url
+            .to_ascii_lowercase()
+            .split('?')
+            .next()
+            .unwrap_or_default()
+            .ends_with(".nzb")
+}
+
+fn get_usenet_hash(request: &RsRequest) -> String {
+    format!("{:x}", md5::compute(request.url.as_bytes()))
+}
+
+enum ProcessingId {
+    Torrent(i32),
+    Usenet(i32),
+}
+
+fn parse_processing_id(processing_id: &str) -> FnResult<ProcessingId> {
+    if let Some(id) = processing_id.strip_prefix("usenet:") {
+        let usenet_id = id.parse().map_err(|_| {
+            WithReturnCode::new(extism_pdk::Error::msg("Invalid usenet processing_id"), 400)
+        })?;
+        Ok(ProcessingId::Usenet(usenet_id))
+    } else {
+        let torrent_id = processing_id.parse().map_err(|_| {
+            WithReturnCode::new(extism_pdk::Error::msg("Invalid processing_id"), 400)
+        })?;
+        Ok(ProcessingId::Torrent(torrent_id))
+    }
+}
 
 fn extract_btih_hash(magnet: &str) -> Option<String> {
     if !magnet.starts_with("magnet:?") {
@@ -727,18 +1183,27 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 
 fn get_canonical_hash(raw_hash: &str) -> FnResult<String> {
     if raw_hash.is_empty() {
-        return Err(WithReturnCode(extism_pdk::Error::msg("Invalid BTIH hash"), 400));
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg("Invalid BTIH hash"),
+            400,
+        ));
     }
     let hash = if raw_hash.len() == 40 {
         raw_hash.to_lowercase()
     } else if raw_hash.len() == 32 {
         let bytes = base32_decode(&raw_hash.to_uppercase());
         if bytes.len() != 20 {
-            return Err(WithReturnCode(extism_pdk::Error::msg("Invalid base32 BTIH hash"), 400));
+            return Err(WithReturnCode(
+                extism_pdk::Error::msg("Invalid base32 BTIH hash"),
+                400,
+            ));
         }
         bytes_to_hex(&bytes)
     } else {
-        return Err(WithReturnCode(extism_pdk::Error::msg("Invalid BTIH hash length"), 400));
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg("Invalid BTIH hash length"),
+            400,
+        ));
     };
     Ok(hash)
 }
@@ -760,39 +1225,123 @@ fn clear_cached_torrent_id(canonical_hash: &str) {
     let _ = var::remove(&key);
 }
 
-fn find_matching_file<'a>(files: &'a [MyFile], selected_file: &Option<String>) -> Option<&'a MyFile> {
+fn find_matching_file<'a>(
+    files: &'a [MyFile],
+    selected_file: &Option<String>,
+) -> Option<&'a MyFile> {
     if files.len() == 1 {
         return Some(&files[0]);
     }
     let selected = selected_file.as_deref().unwrap_or_default();
-    files.iter().find(|f| f.short_name == selected || f.name == selected)
+    files
+        .iter()
+        .find(|f| f.short_name == selected || f.name == selected)
 }
 
-fn try_cached_torrent(token: &str, canonical_hash: &str, selected_file: &Option<String>) -> Option<(i32, MyFile)> {
+fn try_cached_torrent(
+    token: &str,
+    canonical_hash: &str,
+    selected_file: &Option<String>,
+) -> Option<(i32, MyFile)> {
     let cached_id = get_cached_torrent_id(canonical_hash)?;
-    log!(LogLevel::Info, "Cache hit for hash {}, torrent_id={}", canonical_hash, cached_id);
+    log!(
+        LogLevel::Info,
+        "Cache hit for hash {}, torrent_id={}",
+        canonical_hash,
+        cached_id
+    );
     match get_my_torrent(token, cached_id) {
         Ok(t) => {
             let files = t.files.unwrap_or_default();
             match find_matching_file(&files, selected_file) {
                 Some(file) => Some((cached_id, file.clone())),
                 None => {
-                    log!(LogLevel::Warn, "Cache hit (id={}) but no matching file for {:?}", cached_id, selected_file);
+                    log!(
+                        LogLevel::Warn,
+                        "Cache hit (id={}) but no matching file for {:?}",
+                        cached_id,
+                        selected_file
+                    );
                     None
                 }
             }
         }
         Err(e) => {
-            log!(LogLevel::Warn, "Cache stale for {}: {:?}, clearing", canonical_hash, e);
+            log!(
+                LogLevel::Warn,
+                "Cache stale for {}: {:?}, clearing",
+                canonical_hash,
+                e
+            );
             clear_cached_torrent_id(canonical_hash);
             None
         }
     }
 }
 
+fn set_cached_usenet_id(usenet_hash: &str, usenet_id: i32) {
+    let key = format!("usenet:{}", usenet_hash);
+    let _ = var::set(&key, usenet_id.to_string());
+}
+
+fn get_cached_usenet_id(usenet_hash: &str) -> Option<i32> {
+    let key = format!("usenet:{}", usenet_hash);
+    var::get::<String>(&key).ok()?.and_then(|s| s.parse().ok())
+}
+
+fn clear_cached_usenet_id(usenet_hash: &str) {
+    let key = format!("usenet:{}", usenet_hash);
+    let _ = var::remove(&key);
+}
+
+fn try_cached_usenet(
+    token: &str,
+    usenet_hash: &str,
+    selected_file: &Option<String>,
+) -> Option<(i32, MyFile)> {
+    let cached_id = get_cached_usenet_id(usenet_hash)?;
+    log!(
+        LogLevel::Info,
+        "Cache hit for hash {}, usenet_id={}",
+        usenet_hash,
+        cached_id
+    );
+    match get_my_usenet(token, cached_id) {
+        Ok(u) => {
+            let files = u.files.unwrap_or_default();
+            match find_matching_file(&files, selected_file) {
+                Some(file) => Some((cached_id, file.clone())),
+                None => {
+                    log!(
+                        LogLevel::Warn,
+                        "Usenet cache hit (id={}) but no matching file for {:?}",
+                        cached_id,
+                        selected_file
+                    );
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            log!(
+                LogLevel::Warn,
+                "Usenet cache stale for {}: {:?}, clearing",
+                usenet_hash,
+                e
+            );
+            clear_cached_usenet_id(usenet_hash);
+            None
+        }
+    }
+}
+
 fn check_instant_internal(request: &RsRequest, token: &str) -> FnResult<Option<TorrentInfo>> {
-    let raw_hash = extract_btih_hash(&request.url)
-        .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("Invalid magnet link: no BTIH hash found"), 400))?;
+    let raw_hash = extract_btih_hash(&request.url).ok_or_else(|| {
+        WithReturnCode(
+            extism_pdk::Error::msg("Invalid magnet link: no BTIH hash found"),
+            400,
+        )
+    })?;
     let canonical_hash = get_canonical_hash(&raw_hash)?;
 
     let encoded_hash = encode(&canonical_hash);
@@ -810,11 +1359,22 @@ fn check_instant_internal(request: &RsRequest, token: &str) -> FnResult<Option<T
 
     if res.status_code() != 200 {
         let error_msg = String::from_utf8_lossy(&res.body()).to_string();
-        return Err(WithReturnCode(extism_pdk::Error::msg(format!("HTTP {}: {}", res.status_code(), error_msg)), res.status_code() as i32));
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg(format!("HTTP {}: {}", res.status_code(), error_msg)),
+            res.status_code() as i32,
+        ));
     }
 
-    let response: ApiResponse = res.json()
-        .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON check instant result parse error: {}\nBody:\n {}", e, String::from_utf8(res.body()).unwrap_or("no body".to_string()))), 500))?;
+    let response: ApiResponse = res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "JSON check instant result parse error: {}\nBody:\n {}",
+                e,
+                String::from_utf8(res.body()).unwrap_or("no body".to_string())
+            )),
+            500,
+        )
+    })?;
 
     if let Some(err_msg) = response.error {
         return Err(WithReturnCode(extism_pdk::Error::msg(err_msg), 500));
@@ -827,13 +1387,18 @@ fn check_instant_internal(request: &RsRequest, token: &str) -> FnResult<Option<T
     })
 }
 
+fn check_usenet_instant_internal(
+    request: &RsRequest,
+    token: &str,
+) -> FnResult<Option<TorrentInfo>> {
+    let usenet_hash = get_usenet_hash(request);
+    let encoded_hash = encode(&usenet_hash);
 
-fn get_my_torrents(token: &str, limit: i32, bypass_cache: Option<bool>) -> FnResult<Vec<MyTorrent>> {
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     headers.insert("Authorization".to_string(), format!("Bearer {}", token));
 
     let req = HttpRequest {
-        url: format!("https://api.torbox.app/v1/api/torrents/mylist?limit={}&bypass_cache={}", limit, bypass_cache.unwrap_or_default()),
+        url: format!("https://api.torbox.app/v1/api/usenet/checkcached?hash={}&format=object&list_files=true", encoded_hash),
         headers,
         method: Some("GET".into()),
     };
@@ -842,17 +1407,156 @@ fn get_my_torrents(token: &str, limit: i32, bypass_cache: Option<bool>) -> FnRes
 
     if res.status_code() != 200 {
         let error_msg = String::from_utf8_lossy(&res.body()).to_string();
-        return Err(WithReturnCode(extism_pdk::Error::msg(format!("HTTP error getting my torrent list {}: {}", res.status_code(), error_msg)), res.status_code() as i32));
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg(format!("HTTP {}: {}", res.status_code(), error_msg)),
+            res.status_code() as i32,
+        ));
     }
 
-    let response: MyTorrentsResponse = res.json()
-        .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON check instant result parse error: {}\nBody:\n {}", e, String::from_utf8(res.body()).unwrap_or("no body".to_string()))), 500))?;
+    let response: ApiResponse = res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "JSON check usenet instant result parse error: {}\nBody:\n {}",
+                e,
+                String::from_utf8(res.body()).unwrap_or("no body".to_string())
+            )),
+            500,
+        )
+    })?;
 
-   Ok(response.data)
+    if let Some(err_msg) = response.error {
+        return Err(WithReturnCode(extism_pdk::Error::msg(err_msg), 500));
+    }
+
+    Ok(if response.success {
+        if let Some(info) = response.data.get(&usenet_hash).cloned() {
+            Some(info)
+        } else {
+            response
+                .data
+                .into_iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(&usenet_hash))
+                .map(|(_, value)| value)
+        }
+    } else {
+        None
+    })
 }
 
-fn search_my_torrents(token: &str, canonical_hash: &str, limit: i32, bypass_cache: Option<bool>) -> FnResult<Option<MyTorrent>> {
-    Ok(get_my_torrents(token, limit, bypass_cache)?.iter().find(|t| t.hash.eq_ignore_ascii_case(&canonical_hash)).cloned())
+fn get_my_torrents(
+    token: &str,
+    limit: i32,
+    bypass_cache: Option<bool>,
+) -> FnResult<Vec<MyTorrent>> {
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+
+    let req = HttpRequest {
+        url: format!(
+            "https://api.torbox.app/v1/api/torrents/mylist?limit={}&bypass_cache={}",
+            limit,
+            bypass_cache.unwrap_or_default()
+        ),
+        headers,
+        method: Some("GET".into()),
+    };
+
+    let res = http::request::<()>(&req, None)?;
+
+    if res.status_code() != 200 {
+        let error_msg = String::from_utf8_lossy(&res.body()).to_string();
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "HTTP error getting my torrent list {}: {}",
+                res.status_code(),
+                error_msg
+            )),
+            res.status_code() as i32,
+        ));
+    }
+
+    let response: MyTorrentsResponse = res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "JSON check instant result parse error: {}\nBody:\n {}",
+                e,
+                String::from_utf8(res.body()).unwrap_or("no body".to_string())
+            )),
+            500,
+        )
+    })?;
+
+    Ok(response.data)
+}
+
+fn get_my_usenet_downloads(
+    token: &str,
+    limit: i32,
+    bypass_cache: Option<bool>,
+) -> FnResult<Vec<MyTorrent>> {
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+
+    let req = HttpRequest {
+        url: format!(
+            "https://api.torbox.app/v1/api/usenet/mylist?limit={}&bypass_cache={}",
+            limit,
+            bypass_cache.unwrap_or_default()
+        ),
+        headers,
+        method: Some("GET".into()),
+    };
+
+    let res = http::request::<()>(&req, None)?;
+
+    if res.status_code() != 200 {
+        let error_msg = String::from_utf8_lossy(&res.body()).to_string();
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "HTTP error getting my usenet list {}: {}",
+                res.status_code(),
+                error_msg
+            )),
+            res.status_code() as i32,
+        ));
+    }
+
+    let response: MyTorrentsResponse = res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "JSON usenet list parse error: {}\nBody:\n {}",
+                e,
+                String::from_utf8(res.body()).unwrap_or("no body".to_string())
+            )),
+            500,
+        )
+    })?;
+
+    Ok(response.data)
+}
+
+fn search_my_torrents(
+    token: &str,
+    canonical_hash: &str,
+    limit: i32,
+    bypass_cache: Option<bool>,
+) -> FnResult<Option<MyTorrent>> {
+    Ok(get_my_torrents(token, limit, bypass_cache)?
+        .iter()
+        .find(|t| t.hash.eq_ignore_ascii_case(&canonical_hash))
+        .cloned())
+}
+
+fn search_my_usenet(
+    token: &str,
+    usenet_hash: &str,
+    limit: i32,
+    bypass_cache: Option<bool>,
+) -> FnResult<Option<MyTorrent>> {
+    Ok(get_my_usenet_downloads(token, limit, bypass_cache)?
+        .iter()
+        .find(|u| u.hash.eq_ignore_ascii_case(usenet_hash))
+        .cloned())
 }
 
 fn get_my_torrent(token: &str, id: i32) -> FnResult<MyTorrent> {
@@ -860,7 +1564,10 @@ fn get_my_torrent(token: &str, id: i32) -> FnResult<MyTorrent> {
     headers.insert("Authorization".to_string(), format!("Bearer {}", token));
 
     let req = HttpRequest {
-        url: format!("https://api.torbox.app/v1/api/torrents/mylist?id={}&bypass_cache=true", id),
+        url: format!(
+            "https://api.torbox.app/v1/api/torrents/mylist?id={}&bypass_cache=true",
+            id
+        ),
         headers,
         method: Some("GET".into()),
     };
@@ -869,28 +1576,101 @@ fn get_my_torrent(token: &str, id: i32) -> FnResult<MyTorrent> {
 
     if res.status_code() != 200 {
         let error_msg = String::from_utf8_lossy(&res.body()).to_string();
-        return Err(WithReturnCode(extism_pdk::Error::msg(format!("HTTP error getting my torrent by id({}) {}: {}", id, res.status_code(), error_msg)), res.status_code() as i32));
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "HTTP error getting my torrent by id({}) {}: {}",
+                id,
+                res.status_code(),
+                error_msg
+            )),
+            res.status_code() as i32,
+        ));
     }
 
-    let response: MyTorrentResponse = res.json()
-        .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON get one of my torrent by id({}) parse error: {}\nBody:\n {}", id, e, String::from_utf8(res.body()).unwrap_or("no body".to_string()))), 500))?;
+    let response: MyTorrentResponse = res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "JSON get one of my torrent by id({}) parse error: {}\nBody:\n {}",
+                id,
+                e,
+                String::from_utf8(res.body()).unwrap_or("no body".to_string())
+            )),
+            500,
+        )
+    })?;
 
-   Ok(response.data)
+    Ok(response.data)
 }
 
-fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token: &str, permanent: bool) -> FnResult<(String, MyFile)> {
+fn get_my_usenet(token: &str, id: i32) -> FnResult<MyTorrent> {
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
 
+    let req = HttpRequest {
+        url: format!(
+            "https://api.torbox.app/v1/api/usenet/mylist?id={}&bypass_cache=true",
+            id
+        ),
+        headers,
+        method: Some("GET".into()),
+    };
+
+    let res = http::request::<()>(&req, None)?;
+
+    if res.status_code() != 200 {
+        let error_msg = String::from_utf8_lossy(&res.body()).to_string();
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "HTTP error getting my usenet by id({}) {}: {}",
+                id,
+                res.status_code(),
+                error_msg
+            )),
+            res.status_code() as i32,
+        ));
+    }
+
+    let response: MyTorrentResponse = res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "JSON get one of my usenet by id({}) parse error: {}\nBody:\n {}",
+                id,
+                e,
+                String::from_utf8(res.body()).unwrap_or("no body".to_string())
+            )),
+            500,
+        )
+    })?;
+
+    Ok(response.data)
+}
+
+fn get_file_download_url(
+    request: &RsRequest,
+    torrent_info: &TorrentInfo,
+    token: &str,
+    permanent: bool,
+) -> FnResult<(String, MyFile)> {
     let files = &torrent_info.files;
 
     if files.is_none() || files.as_ref().unwrap_or(&vec![]).is_empty() {
-        return Err(WithReturnCode(extism_pdk::Error::msg("No files found in torrent"), 404));
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg("No files found in torrent"),
+            404,
+        ));
     }
 
     // Try local cache first to skip createtorrent
     if let Some(raw_hash) = extract_btih_hash(&request.url) {
         if let Ok(canonical_hash) = get_canonical_hash(&raw_hash) {
-            if let Some((cached_id, file)) = try_cached_torrent(token, &canonical_hash, &request.selected_file) {
-                log!(LogLevel::Info, "get_file_download_url: using cached torrent_id={}", cached_id);
+            if let Some((cached_id, file)) =
+                try_cached_torrent(token, &canonical_hash, &request.selected_file)
+            {
+                log!(
+                    LogLevel::Info,
+                    "get_file_download_url: using cached torrent_id={}",
+                    cached_id
+                );
                 if permanent {
                     return Ok((format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", cached_id, file.id), file));
                 }
@@ -912,7 +1692,10 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
                     }
                 }
                 // If requestdl failed, fall through to createtorrent
-                log!(LogLevel::Warn, "Cache hit but requestdl failed, falling through to createtorrent");
+                log!(
+                    LogLevel::Warn,
+                    "Cache hit but requestdl failed, falling through to createtorrent"
+                );
             }
         }
     }
@@ -926,7 +1709,10 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
     let body_vec = body_str.as_bytes().to_vec();
 
     let mut create_headers = headers.clone();
-    create_headers.insert("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string());
+    create_headers.insert(
+        "Content-Type".to_string(),
+        "application/x-www-form-urlencoded".to_string(),
+    );
 
     let create_req = HttpRequest {
         url: "https://api.torbox.app/v1/api/torrents/createtorrent".to_string(),
@@ -938,11 +1724,26 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
 
     if create_res.status_code() != 200 {
         let error_msg = String::from_utf8_lossy(&create_res.body()).to_string();
-        return Err(WithReturnCode(extism_pdk::Error::msg(format!("Create torrent HTTP {}: {}\nBody:\n {}", create_res.status_code(), error_msg, String::from_utf8(create_res.body()).unwrap_or("no body".to_string()))), create_res.status_code() as i32));
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "Create torrent HTTP {}: {}\nBody:\n {}",
+                create_res.status_code(),
+                error_msg,
+                String::from_utf8(create_res.body()).unwrap_or("no body".to_string())
+            )),
+            create_res.status_code() as i32,
+        ));
     }
 
-    let create_response: CreateTorrentResponse = create_res.json()
-        .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON parse error during create torrent ({}): {}", create_req.url, e)), 500))?;
+    let create_response: CreateTorrentResponse = create_res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "JSON parse error during create torrent ({}): {}",
+                create_req.url, e
+            )),
+            500,
+        )
+    })?;
 
     if let Some(err_msg) = create_response.error {
         return Err(WithReturnCode(extism_pdk::Error::msg(err_msg), 500));
@@ -957,18 +1758,26 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
         }
     }
 
-
     let my_torrent = get_my_torrent(token, torrent_id)?;
-    
+
     let my_torrent_files = my_torrent.files.unwrap_or_default();
-    
+
     let file = if my_torrent_files.len() == 1 {
         &my_torrent_files[0]
     } else {
-        my_torrent_files.iter().find(|f| { f.short_name == request.selected_file.clone().unwrap_or_default() || f.name == request.selected_file.clone().unwrap_or_default() }).ok_or(extism_pdk::Error::msg(format!("Add torrent - Unable to find file({:?}) in {:?}", request.selected_file, my_torrent_files)))?
+        my_torrent_files
+            .iter()
+            .find(|f| {
+                f.short_name == request.selected_file.clone().unwrap_or_default()
+                    || f.name == request.selected_file.clone().unwrap_or_default()
+            })
+            .ok_or(extism_pdk::Error::msg(format!(
+                "Add torrent - Unable to find file({:?}) in {:?}",
+                request.selected_file, my_torrent_files
+            )))?
     };
     let file_id = file.id;
-    
+
     if permanent {
         // For permanent requests, we are done here
         return Ok((format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", torrent_id, file_id), file.clone()));
@@ -984,11 +1793,140 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
 
     if dl_res.status_code() != 200 {
         let error_msg = String::from_utf8_lossy(&dl_res.body()).to_string();
-        return Err(WithReturnCode(extism_pdk::Error::msg(format!("Request dl HTTP({}) {}: {}", dl_req.url, dl_res.status_code(), error_msg)), dl_res.status_code() as i32));
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "Request dl HTTP({}) {}: {}",
+                dl_req.url,
+                dl_res.status_code(),
+                error_msg
+            )),
+            dl_res.status_code() as i32,
+        ));
     }
 
-    let dl_response: DownloadLinkResponse = dl_res.json()
-        .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON parse error during request dl ({}): {}", dl_req.url, e)), 500))?;
+    let dl_response: DownloadLinkResponse = dl_res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "JSON parse error during request dl ({}): {}",
+                dl_req.url, e
+            )),
+            500,
+        )
+    })?;
+
+    if let Some(err_msg) = dl_response.error {
+        return Err(WithReturnCode(extism_pdk::Error::msg(err_msg), 500));
+    }
+
+    Ok((dl_response.data, file.clone()))
+}
+
+fn get_usenet_file_download_url(
+    request: &RsRequest,
+    token: &str,
+    permanent: bool,
+) -> FnResult<(String, MyFile)> {
+    let usenet_hash = get_usenet_hash(request);
+
+    if let Some((cached_id, file)) = try_cached_usenet(token, &usenet_hash, &request.selected_file)
+    {
+        log!(
+            LogLevel::Info,
+            "get_usenet_file_download_url: using cached usenet_id={}",
+            cached_id
+        );
+        if permanent {
+            return Ok((format!("torbox://api.torbox.app/v1/api/usenet/requestdl?token=_TOKEN_&redirect=true&usenet_id={}&file_id={}", cached_id, file.id), file));
+        }
+
+        let mut headers: BTreeMap<String, String> = BTreeMap::new();
+        headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+        let dl_req = HttpRequest {
+            url: format!("https://api.torbox.app/v1/api/usenet/requestdl?token={}&redirect=false&usenet_id={}&file_id={}", token, cached_id, file.id),
+            headers,
+            method: Some("GET".into()),
+        };
+        if let Ok(dl_res) = http::request::<()>(&dl_req, None) {
+            if dl_res.status_code() == 200 {
+                if let Ok(dl_response) = dl_res.json::<DownloadLinkResponse>() {
+                    if dl_response.error.is_none() {
+                        return Ok((dl_response.data, file));
+                    }
+                }
+            }
+        }
+        log!(
+            LogLevel::Warn,
+            "Usenet cache hit but requestdl failed, falling through to createusenetdownload"
+        );
+    }
+
+    let usenet_id = create_usenet_for_download(&request.url, token, true)?;
+    set_cached_usenet_id(&usenet_hash, usenet_id);
+
+    let my_usenet = get_my_usenet(token, usenet_id)?;
+    let my_usenet_files = my_usenet.files.unwrap_or_default();
+
+    if my_usenet_files.is_empty() {
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg("No files found in usenet download"),
+            404,
+        ));
+    }
+
+    let file = if my_usenet_files.len() == 1 {
+        &my_usenet_files[0]
+    } else {
+        my_usenet_files
+            .iter()
+            .find(|f| {
+                f.short_name == request.selected_file.clone().unwrap_or_default()
+                    || f.name == request.selected_file.clone().unwrap_or_default()
+            })
+            .ok_or(extism_pdk::Error::msg(format!(
+                "Add usenet - Unable to find file({:?}) in {:?}",
+                request.selected_file, my_usenet_files
+            )))?
+    };
+    let file_id = file.id;
+
+    if permanent {
+        return Ok((format!("torbox://api.torbox.app/v1/api/usenet/requestdl?token=_TOKEN_&redirect=true&usenet_id={}&file_id={}", usenet_id, file_id), file.clone()));
+    }
+
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+
+    let dl_req = HttpRequest {
+        url: format!("https://api.torbox.app/v1/api/usenet/requestdl?token={}&redirect=false&usenet_id={}&file_id={}", token, usenet_id, file_id),
+        headers,
+        method: Some("GET".into()),
+    };
+
+    let dl_res = http::request::<()>(&dl_req, None)?;
+
+    if dl_res.status_code() != 200 {
+        let error_msg = String::from_utf8_lossy(&dl_res.body()).to_string();
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "Request usenet dl HTTP({}) {}: {}",
+                dl_req.url,
+                dl_res.status_code(),
+                error_msg
+            )),
+            dl_res.status_code() as i32,
+        ));
+    }
+
+    let dl_response: DownloadLinkResponse = dl_res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "JSON parse error during usenet request dl ({}): {}",
+                dl_req.url, e
+            )),
+            500,
+        )
+    })?;
 
     if let Some(err_msg) = dl_response.error {
         return Err(WithReturnCode(extism_pdk::Error::msg(err_msg), 500));
@@ -1001,7 +1939,10 @@ fn get_file_download_url(request: &RsRequest, torrent_info: &TorrentInfo, token:
 fn create_torrent_for_download(magnet_url: &str, token: &str) -> FnResult<i32> {
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     headers.insert("Authorization".to_string(), format!("Bearer {}", token));
-    headers.insert("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string());
+    headers.insert(
+        "Content-Type".to_string(),
+        "application/x-www-form-urlencoded".to_string(),
+    );
 
     let magnet_encoded = encode(magnet_url);
     let body_str = format!("magnet={}", magnet_encoded);
@@ -1017,11 +1958,22 @@ fn create_torrent_for_download(magnet_url: &str, token: &str) -> FnResult<i32> {
 
     if create_res.status_code() != 200 {
         let error_msg = String::from_utf8_lossy(&create_res.body()).to_string();
-        return Err(WithReturnCode(extism_pdk::Error::msg(format!("Create torrent HTTP {}: {}", create_res.status_code(), error_msg)), create_res.status_code() as i32));
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "Create torrent HTTP {}: {}",
+                create_res.status_code(),
+                error_msg
+            )),
+            create_res.status_code() as i32,
+        ));
     }
 
-    let create_response: CreateTorrentResponse = create_res.json()
-        .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON parse error during create torrent: {}", e)), 500))?;
+    let create_response: CreateTorrentResponse = create_res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!("JSON parse error during create torrent: {}", e)),
+            500,
+        )
+    })?;
 
     if let Some(err_msg) = create_response.error {
         return Err(WithReturnCode(extism_pdk::Error::msg(err_msg), 500));
@@ -1039,10 +1991,71 @@ fn create_torrent_for_download(magnet_url: &str, token: &str) -> FnResult<i32> {
     Ok(torrent_id)
 }
 
+fn create_usenet_for_download(
+    nzb_url: &str,
+    token: &str,
+    add_only_if_cached: bool,
+) -> FnResult<i32> {
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+    headers.insert(
+        "Content-Type".to_string(),
+        "application/x-www-form-urlencoded".to_string(),
+    );
+
+    let link_encoded = encode(nzb_url);
+    let body_str = if add_only_if_cached {
+        format!("link={}&add_only_if_cached=true", link_encoded)
+    } else {
+        format!("link={}", link_encoded)
+    };
+    let body_vec = body_str.as_bytes().to_vec();
+
+    let create_req = HttpRequest {
+        url: "https://api.torbox.app/v1/api/usenet/createusenetdownload".to_string(),
+        headers,
+        method: Some("POST".into()),
+    };
+
+    let create_res = http::request::<Vec<u8>>(&create_req, Some(body_vec))?;
+
+    if create_res.status_code() != 200 {
+        let error_msg = String::from_utf8_lossy(&create_res.body()).to_string();
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "Create usenet HTTP {}: {}",
+                create_res.status_code(),
+                error_msg
+            )),
+            create_res.status_code() as i32,
+        ));
+    }
+
+    let create_response: CreateUsenetResponse = create_res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!("JSON parse error during create usenet: {}", e)),
+            500,
+        )
+    })?;
+
+    if let Some(err_msg) = create_response.error {
+        return Err(WithReturnCode(extism_pdk::Error::msg(err_msg), 500));
+    }
+
+    let usenet_id = create_response.data.usenetdownload_id;
+    set_cached_usenet_id(
+        &format!("{:x}", md5::compute(nzb_url.as_bytes())),
+        usenet_id,
+    );
+
+    Ok(usenet_id)
+}
+
 fn is_not_found_message(message: &str) -> bool {
     let normalized = message.to_ascii_lowercase();
     normalized.contains("not found")
         || normalized.contains("no torrent")
+        || normalized.contains("no usenet")
         || normalized.contains("does not exist")
         || normalized.contains("doesn't exist")
 }
@@ -1058,7 +2071,10 @@ fn is_torrent_absent(token: &str, torrent_id: i32) -> FnResult<bool> {
     headers.insert("Authorization".to_string(), format!("Bearer {}", token));
 
     let req = HttpRequest {
-        url: format!("https://api.torbox.app/v1/api/torrents/mylist?id={}&bypass_cache=true", torrent_id),
+        url: format!(
+            "https://api.torbox.app/v1/api/torrents/mylist?id={}&bypass_cache=true",
+            torrent_id
+        ),
         headers,
         method: Some("GET".into()),
     };
@@ -1076,10 +2092,45 @@ fn is_torrent_absent(token: &str, torrent_id: i32) -> FnResult<bool> {
 
     if let Ok(response) = res.json::<TorboxStatusResponse>() {
         if response.success == Some(false) {
-            let message = response
-                .error
-                .or(response.detail)
-                .unwrap_or_default();
+            let message = response.error.or(response.detail).unwrap_or_default();
+            return Ok(is_not_found_message(&message));
+        }
+    }
+
+    if res.status_code() != 200 {
+        return Ok(is_not_found_message(&body));
+    }
+
+    Ok(false)
+}
+
+fn is_usenet_absent(token: &str, usenet_id: i32) -> FnResult<bool> {
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+
+    let req = HttpRequest {
+        url: format!(
+            "https://api.torbox.app/v1/api/usenet/mylist?id={}&bypass_cache=true",
+            usenet_id
+        ),
+        headers,
+        method: Some("GET".into()),
+    };
+
+    let res = http::request::<()>(&req, None)?;
+    let body = String::from_utf8_lossy(&res.body()).to_string();
+
+    if res.status_code() == 404 {
+        return Ok(true);
+    }
+
+    if res.status_code() == 500 && body.trim().is_empty() {
+        return Ok(true);
+    }
+
+    if let Ok(response) = res.json::<TorboxStatusResponse>() {
+        if response.success == Some(false) {
+            let message = response.error.or(response.detail).unwrap_or_default();
             return Ok(is_not_found_message(&message));
         }
     }
@@ -1097,7 +2148,10 @@ fn control_torrent(token: &str, torrent_id: i32, operation: &str) -> FnResult<()
     headers.insert("Authorization".to_string(), format!("Bearer {}", token));
     headers.insert("Content-Type".to_string(), "application/json".to_string());
 
-    let body = format!(r#"{{"torrent_id": {}, "operation": "{}"}}"#, torrent_id, operation);
+    let body = format!(
+        r#"{{"torrent_id": {}, "operation": "{}"}}"#,
+        torrent_id, operation
+    );
     let body_vec = body.as_bytes().to_vec();
 
     let req = HttpRequest {
@@ -1127,11 +2181,22 @@ fn control_torrent(token: &str, torrent_id: i32, operation: &str) -> FnResult<()
         {
             return Ok(());
         }
-        return Err(WithReturnCode(extism_pdk::Error::msg(format!("Control torrent HTTP {}: {}", res.status_code(), error_msg)), res.status_code() as i32));
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "Control torrent HTTP {}: {}",
+                res.status_code(),
+                error_msg
+            )),
+            res.status_code() as i32,
+        ));
     }
 
-    let response: ControlTorrentResponse = res.json()
-        .map_err(|e| WithReturnCode(extism_pdk::Error::msg(format!("JSON parse error during control torrent: {}", e)), 500))?;
+    let response: ControlTorrentResponse = res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!("JSON parse error during control torrent: {}", e)),
+            500,
+        )
+    })?;
 
     if !response.success {
         let response_detail = response.detail.clone();
@@ -1148,6 +2213,76 @@ fn control_torrent(token: &str, torrent_id: i32, operation: &str) -> FnResult<()
     Ok(())
 }
 
+fn control_usenet(token: &str, usenet_id: i32, operation: &str) -> FnResult<()> {
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+    headers.insert("Content-Type".to_string(), "application/json".to_string());
+
+    let body = format!(
+        r#"{{"usenet_id": {}, "operation": "{}"}}"#,
+        usenet_id, operation
+    );
+    let body_vec = body.as_bytes().to_vec();
+
+    let req = HttpRequest {
+        url: "https://api.torbox.app/v1/api/usenet/controlusenetdownload".to_string(),
+        headers,
+        method: Some("POST".into()),
+    };
+
+    let res = http::request::<Vec<u8>>(&req, Some(body_vec))?;
+
+    if res.status_code() != 200 {
+        let error_msg = String::from_utf8_lossy(&res.body()).to_string();
+        let parsed_error = res.json::<TorboxStatusResponse>().ok();
+        let has_idempotent_delete_error = parsed_error
+            .as_ref()
+            .map(|response| {
+                is_idempotent_delete_error(
+                    response.error.as_deref().unwrap_or_default(),
+                    response.detail.as_deref().unwrap_or_default(),
+                )
+            })
+            .unwrap_or(false);
+        if operation == "delete"
+            && (has_idempotent_delete_error
+                || (res.status_code() == 500 && error_msg.trim().is_empty())
+                || is_usenet_absent(token, usenet_id).unwrap_or(false))
+        {
+            return Ok(());
+        }
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "Control usenet HTTP {}: {}",
+                res.status_code(),
+                error_msg
+            )),
+            res.status_code() as i32,
+        ));
+    }
+
+    let response: ControlTorrentResponse = res.json().map_err(|e| {
+        WithReturnCode(
+            extism_pdk::Error::msg(format!("JSON parse error during control usenet: {}", e)),
+            500,
+        )
+    })?;
+
+    if !response.success {
+        let response_detail = response.detail.clone();
+        let response_error = response.error.unwrap_or(response_detail.clone());
+        if operation == "delete"
+            && (is_idempotent_delete_error(&response_error, &response_detail)
+                || is_usenet_absent(token, usenet_id).unwrap_or(false))
+        {
+            return Ok(());
+        }
+        return Err(WithReturnCode(extism_pdk::Error::msg(response_error), 500));
+    }
+
+    Ok(())
+}
+
 /// Maps Torbox download_state to RsProcessingStatus
 fn map_download_state_to_status(download_state: Option<&str>, cached: bool) -> RsProcessingStatus {
     if cached {
@@ -1155,7 +2290,9 @@ fn map_download_state_to_status(download_state: Option<&str>, cached: bool) -> R
     }
 
     match download_state {
-        Some("downloading") | Some("metaDL") | Some("checking") | Some("queued") => RsProcessingStatus::Processing,
+        Some("downloading") | Some("metaDL") | Some("checking") | Some("queued") => {
+            RsProcessingStatus::Processing
+        }
         Some("completed") | Some("uploading") | Some("seeding") => RsProcessingStatus::Finished,
         Some("paused") | Some("stalled") => RsProcessingStatus::Paused,
         Some("error") | Some("failed") => RsProcessingStatus::Error,
@@ -1164,23 +2301,38 @@ fn map_download_state_to_status(download_state: Option<&str>, cached: bool) -> R
 }
 
 /// Constructs the final RsRequest with download URL when torrent is finished
-fn construct_final_request(torrent: &MyTorrent, selected_file: Option<&str>) -> FnResult<RsRequest> {
-    let files = torrent.files.as_ref().ok_or_else(||
-        WithReturnCode(extism_pdk::Error::msg("No files found in torrent"), 404))?;
+fn construct_final_request(
+    torrent: &MyTorrent,
+    selected_file: Option<&str>,
+) -> FnResult<RsRequest> {
+    let files = torrent
+        .files
+        .as_ref()
+        .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("No files found in torrent"), 404))?;
 
     if files.is_empty() {
-        return Err(WithReturnCode(extism_pdk::Error::msg("No files found in torrent"), 404));
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg("No files found in torrent"),
+            404,
+        ));
     }
 
     let file = if files.len() == 1 {
         &files[0]
     } else if let Some(selected) = selected_file {
-        files.iter()
+        files
+            .iter()
             .find(|f| f.short_name == selected || f.name == selected)
-            .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg(format!("Selected file '{}' not found", selected)), 404))?
+            .ok_or_else(|| {
+                WithReturnCode(
+                    extism_pdk::Error::msg(format!("Selected file '{}' not found", selected)),
+                    404,
+                )
+            })?
     } else {
         // Pick the largest file
-        files.iter()
+        files
+            .iter()
             .max_by_key(|f| f.size)
             .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("No files found"), 404))?
     };
@@ -1188,6 +2340,59 @@ fn construct_final_request(torrent: &MyTorrent, selected_file: Option<&str>) -> 
     let url = format!(
         "torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}",
         torrent.id, file.id
+    );
+
+    Ok(RsRequest {
+        url,
+        status: RsRequestStatus::FinalPublic,
+        permanent: true,
+        mime: Some(file.mimetype.clone()),
+        filename: Some(file.name.clone()),
+        size: Some(file.size.max(0) as u64),
+        ..Default::default()
+    })
+}
+
+fn construct_final_usenet_request(
+    usenet: &MyTorrent,
+    selected_file: Option<&str>,
+) -> FnResult<RsRequest> {
+    let files = usenet.files.as_ref().ok_or_else(|| {
+        WithReturnCode(
+            extism_pdk::Error::msg("No files found in usenet download"),
+            404,
+        )
+    })?;
+
+    if files.is_empty() {
+        return Err(WithReturnCode(
+            extism_pdk::Error::msg("No files found in usenet download"),
+            404,
+        ));
+    }
+
+    let file = if files.len() == 1 {
+        &files[0]
+    } else if let Some(selected) = selected_file {
+        files
+            .iter()
+            .find(|f| f.short_name == selected || f.name == selected)
+            .ok_or_else(|| {
+                WithReturnCode(
+                    extism_pdk::Error::msg(format!("Selected file '{}' not found", selected)),
+                    404,
+                )
+            })?
+    } else {
+        files
+            .iter()
+            .max_by_key(|f| f.size)
+            .ok_or_else(|| WithReturnCode(extism_pdk::Error::msg("No files found"), 404))?
+    };
+
+    let url = format!(
+        "torbox://api.torbox.app/v1/api/usenet/requestdl?token=_TOKEN_&redirect=true&usenet_id={}&file_id={}",
+        usenet.id, file.id
     );
 
     Ok(RsRequest {
