@@ -228,7 +228,7 @@ pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(PluginInformation {
         name: "torbox".into(),
         capabilities: vec![PluginType::Lookup, PluginType::Request],
-        version: 14,
+        version: 15,
         publisher: "neckaros".into(),
         repo: Some("https://github.com/neckaros/plugin-torbox".to_string()),
         description: "search and download torrent or usenet from Torbox".into(),
@@ -377,22 +377,28 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
         let canonical_hash = get_canonical_hash(&raw_hash)?;
 
         // Try local cache first (avoids search_my_torrents + createtorrent API calls)
+        let mut removed_broken = false;
         if let Some((cached_id, file)) =
             try_cached_torrent(token, &canonical_hash, &request.request.selected_file)
         {
-            log!(
-                LogLevel::Info,
-                "Using cached torrent_id={} for hash {}",
-                cached_id,
-                canonical_hash
-            );
-            let mut new_request = request.request.clone();
-            new_request.url = format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", cached_id, file.id);
-            new_request.status = RsRequestStatus::FinalPublic;
-            new_request.permanent = true;
-            new_request.mime = Some(file.mimetype.clone());
-            new_request.filename = Some(file.name.clone());
-            return Ok(Json(new_request));
+            if torrent_is_broken(token, cached_id, file.id) {
+                remove_broken_torrent(token, cached_id, Some(&canonical_hash));
+                removed_broken = true;
+            } else {
+                log!(
+                    LogLevel::Info,
+                    "Using cached torrent_id={} for hash {}",
+                    cached_id,
+                    canonical_hash
+                );
+                let mut new_request = request.request.clone();
+                new_request.url = permanent_torrent_url(cached_id, file.id);
+                new_request.status = RsRequestStatus::FinalPublic;
+                new_request.permanent = true;
+                new_request.mime = Some(file.mimetype.clone());
+                new_request.filename = Some(file.name.clone());
+                return Ok(Json(new_request));
+            }
         }
 
         log!(
@@ -400,40 +406,42 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
             "looking for existing hash {:?}\n",
             canonical_hash
         );
-        let existing = match search_my_torrents(token, &canonical_hash, 500, None)? {
-            Some(value) => Some(value),
-            None => search_my_torrents(token, &canonical_hash, 500, Some(true))?,
+        // After deleting a broken torrent, the user's list (possibly cached by TorBox)
+        // can still show it: add the magnet again instead
+        let existing = if removed_broken {
+            None
+        } else {
+            match search_my_torrents(token, &canonical_hash, 500, None)? {
+                Some(value) => Some(value),
+                None => search_my_torrents(token, &canonical_hash, 500, Some(true))?,
+            }
         };
 
         log!(LogLevel::Debug, "In {:?}\n\n", existing);
 
         if let Some(t) = existing {
-            set_cached_torrent_id(&canonical_hash, t.id as i32);
+            let torrent_id = t.id as i32;
             let my_torrent_files = t.files.unwrap_or_default();
-            if my_torrent_files.len() == 1 {
-                let file = &my_torrent_files[0];
-                log!(LogLevel::Info, "Single File already in list: {}", file.name);
-                let mut new_request = request.request.clone();
-                new_request.url = format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", t.id, file.id);
-                new_request.status = RsRequestStatus::FinalPublic;
-                new_request.permanent = true;
-                new_request.mime = Some(file.mimetype.clone());
-                new_request.filename = Some(file.name.clone());
-                return Ok(Json(new_request));
-            } else if let Some(file) = my_torrent_files.iter().find(|f| {
-                f.short_name == request.request.selected_file.clone().unwrap_or_default()
-                    || f.name == request.request.selected_file.clone().unwrap_or_default()
-            }) {
-                log!(LogLevel::Info, "File already in list: {}", file.name);
-                let mut new_request = request.request.clone();
-                new_request.url = format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", t.id, file.id);
-                new_request.status = RsRequestStatus::FinalPublic;
-                new_request.permanent = true;
-                new_request.mime = Some(file.mimetype.clone());
-                new_request.filename = Some(file.name.clone());
-                return Ok(Json(new_request));
+            if let Some(file) =
+                find_matching_file(&my_torrent_files, &request.request.selected_file)
+            {
+                if torrent_is_broken(token, torrent_id, file.id) {
+                    remove_broken_torrent(token, torrent_id, Some(&canonical_hash));
+                } else {
+                    set_cached_torrent_id(&canonical_hash, torrent_id);
+                    log!(LogLevel::Info, "File already in list: {}", file.name);
+                    let mut new_request = request.request.clone();
+                    new_request.url = permanent_torrent_url(torrent_id, file.id);
+                    new_request.status = RsRequestStatus::FinalPublic;
+                    new_request.permanent = true;
+                    new_request.mime = Some(file.mimetype.clone());
+                    new_request.filename = Some(file.name.clone());
+                    return Ok(Json(new_request));
+                }
+            } else {
+                set_cached_torrent_id(&canonical_hash, torrent_id);
+                log!(LogLevel::Warn, "Torrent found in list (id={}) but could not match selected_file {:?} among {} files", t.id, request.request.selected_file, my_torrent_files.len());
             }
-            log!(LogLevel::Warn, "Torrent found in list (id={}) but could not match selected_file {:?} among {} files", t.id, request.request.selected_file, my_torrent_files.len());
         }
 
         log!(
@@ -1645,78 +1653,164 @@ fn get_my_usenet(token: &str, id: i32) -> FnResult<MyTorrent> {
     Ok(response.data)
 }
 
-fn get_file_download_url(
-    request: &RsRequest,
-    torrent_info: &TorrentInfo,
-    token: &str,
-    permanent: bool,
-) -> FnResult<(String, MyFile)> {
-    let files = &torrent_info.files;
+/// TorBox's answer to `requestdl` for a torrent it lists but can no longer serve
+/// (seen on torrents added from its instant cache). Only deleting the torrent
+/// and adding it again repairs it.
+const TORBOX_BROKEN_TORRENT_ERROR: &str = "DATABASE_ERROR";
 
-    if files.is_none() || files.as_ref().unwrap_or(&vec![]).is_empty() {
-        return Err(WithReturnCode(
-            extism_pdk::Error::msg("No files found in torrent"),
-            404,
-        ));
+enum DownloadLinkError {
+    /// TorBox can't serve this torrent: delete it and add it again.
+    Broken(String),
+    Other(WithReturnCode<extism_pdk::Error>),
+}
+
+impl From<DownloadLinkError> for WithReturnCode<extism_pdk::Error> {
+    fn from(error: DownloadLinkError) -> Self {
+        match error {
+            DownloadLinkError::Broken(detail) => WithReturnCode(
+                extism_pdk::Error::msg(format!(
+                    "TorBox can't serve this torrent ({}): {}",
+                    TORBOX_BROKEN_TORRENT_ERROR, detail
+                )),
+                500,
+            ),
+            DownloadLinkError::Other(error) => error,
+        }
     }
+}
 
-    // Try local cache first to skip createtorrent
-    if let Some(raw_hash) = extract_btih_hash(&request.url) {
-        if let Ok(canonical_hash) = get_canonical_hash(&raw_hash) {
-            if let Some((cached_id, file)) =
-                try_cached_torrent(token, &canonical_hash, &request.selected_file)
-            {
-                log!(
-                    LogLevel::Info,
-                    "get_file_download_url: using cached torrent_id={}",
-                    cached_id
-                );
-                if permanent {
-                    return Ok((format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", cached_id, file.id), file));
-                }
-                // For non-permanent, request download link
-                let mut headers: BTreeMap<String, String> = BTreeMap::new();
-                headers.insert("Authorization".to_string(), format!("Bearer {}", token));
-                let dl_req = HttpRequest {
-                    url: format!("https://api.torbox.app/v1/api/torrents/requestdl?token={}&redirect=false&torrent_id={}&file_id={}", token, cached_id, file.id),
-                    headers,
-                    method: Some("GET".into()),
-                };
-                if let Ok(dl_res) = http::request::<()>(&dl_req, None) {
-                    if dl_res.status_code() == 200 {
-                        if let Ok(dl_response) = dl_res.json::<DownloadLinkResponse>() {
-                            if dl_response.error.is_none() {
-                                return Ok((dl_response.data, file));
-                            }
-                        }
-                    }
-                }
-                // If requestdl failed, fall through to createtorrent
-                log!(
-                    LogLevel::Warn,
-                    "Cache hit but requestdl failed, falling through to createtorrent"
-                );
-            }
+fn permanent_torrent_url(torrent_id: i32, file_id: i64) -> String {
+    format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", torrent_id, file_id)
+}
+
+/// Asks TorBox for a direct download link to a file of one of the user's torrents.
+fn request_torrent_link(
+    token: &str,
+    torrent_id: i32,
+    file_id: i64,
+) -> Result<String, DownloadLinkError> {
+    let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+    let dl_req = HttpRequest {
+        url: format!(
+            "{}?token={}&redirect=false&torrent_id={}&file_id={}",
+            TORBOX_TORRENT_REQUESTDL, token, torrent_id, file_id
+        ),
+        headers,
+        method: Some("GET".into()),
+    };
+
+    let dl_res = http::request::<()>(&dl_req, None).map_err(|e| {
+        DownloadLinkError::Other(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "Request dl (torrent_id={}, file_id={}): {}",
+                torrent_id, file_id, e
+            )),
+            500,
+        ))
+    })?;
+    let status = dl_res.status_code();
+
+    // TorBox explains its errors in the body, whatever the status code
+    if let Ok(response) = dl_res.json::<TorboxStatusResponse>() {
+        if response.error.as_deref() == Some(TORBOX_BROKEN_TORRENT_ERROR) {
+            return Err(DownloadLinkError::Broken(
+                response.detail.unwrap_or_default(),
+            ));
         }
     }
 
+    if status != 200 {
+        let error_msg = String::from_utf8_lossy(&dl_res.body()).to_string();
+        return Err(DownloadLinkError::Other(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "Request dl HTTP {} (torrent_id={}, file_id={}): {}",
+                status, torrent_id, file_id, error_msg
+            )),
+            status as i32,
+        )));
+    }
+
+    let dl_response: DownloadLinkResponse = dl_res.json().map_err(|e| {
+        DownloadLinkError::Other(WithReturnCode(
+            extism_pdk::Error::msg(format!(
+                "JSON parse error during request dl (torrent_id={}, file_id={}): {}",
+                torrent_id, file_id, e
+            )),
+            500,
+        ))
+    })?;
+
+    if let Some(err_msg) = dl_response.error {
+        return Err(DownloadLinkError::Other(WithReturnCode(
+            extism_pdk::Error::msg(err_msg),
+            500,
+        )));
+    }
+
+    Ok(dl_response.data)
+}
+
+/// True when TorBox lists the torrent but can't serve this file. Other failures
+/// (network, rate limits) don't say the torrent is broken, so they return false.
+fn torrent_is_broken(token: &str, torrent_id: i32, file_id: i64) -> bool {
+    match request_torrent_link(token, torrent_id, file_id) {
+        Err(DownloadLinkError::Broken(detail)) => {
+            log!(
+                LogLevel::Warn,
+                "TorBox can't serve torrent_id={} ({}: {})",
+                torrent_id,
+                TORBOX_BROKEN_TORRENT_ERROR,
+                detail
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Deletes a torrent TorBox can't serve and forgets its id, so that it gets added again.
+fn remove_broken_torrent(token: &str, torrent_id: i32, canonical_hash: Option<&str>) {
+    log!(
+        LogLevel::Warn,
+        "Deleting broken torrent_id={} so it can be added again",
+        torrent_id
+    );
+    if let Some(hash) = canonical_hash {
+        clear_cached_torrent_id(hash);
+    }
+    if let Err(e) = control_torrent(token, torrent_id, "delete") {
+        log!(
+            LogLevel::Warn,
+            "Unable to delete broken torrent_id={}: {:?}",
+            torrent_id,
+            e
+        );
+    }
+}
+
+/// Adds the request's magnet to the user's torrents (cached content only) and
+/// returns the torrent id and the selected file.
+fn add_cached_torrent(
+    request: &RsRequest,
+    token: &str,
+    canonical_hash: Option<&str>,
+) -> FnResult<(i32, MyFile)> {
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+    headers.insert(
+        "Content-Type".to_string(),
+        "application/x-www-form-urlencoded".to_string(),
+    );
 
     // Create torrent to get ID (form data)
     let magnet_encoded = encode(&request.url);
     let body_str = format!("magnet={}&add_only_if_cached=true", magnet_encoded);
     let body_vec = body_str.as_bytes().to_vec();
 
-    let mut create_headers = headers.clone();
-    create_headers.insert(
-        "Content-Type".to_string(),
-        "application/x-www-form-urlencoded".to_string(),
-    );
-
     let create_req = HttpRequest {
         url: "https://api.torbox.app/v1/api/torrents/createtorrent".to_string(),
-        headers: create_headers,
+        headers,
         method: Some("POST".into()),
     };
 
@@ -1726,10 +1820,9 @@ fn get_file_download_url(
         let error_msg = String::from_utf8_lossy(&create_res.body()).to_string();
         return Err(WithReturnCode(
             extism_pdk::Error::msg(format!(
-                "Create torrent HTTP {}: {}\nBody:\n {}",
+                "Create torrent HTTP {}: {}",
                 create_res.status_code(),
-                error_msg,
-                String::from_utf8(create_res.body()).unwrap_or("no body".to_string())
+                error_msg
             )),
             create_res.status_code() as i32,
         ));
@@ -1752,73 +1845,117 @@ fn get_file_download_url(
     let torrent_id = create_response.data.torrent_id;
 
     // Cache the newly created torrent
-    if let Some(raw_hash) = extract_btih_hash(&request.url) {
-        if let Ok(canonical_hash) = get_canonical_hash(&raw_hash) {
-            set_cached_torrent_id(&canonical_hash, torrent_id);
-        }
+    if let Some(hash) = canonical_hash {
+        set_cached_torrent_id(hash, torrent_id);
     }
 
     let my_torrent = get_my_torrent(token, torrent_id)?;
-
     let my_torrent_files = my_torrent.files.unwrap_or_default();
 
-    let file = if my_torrent_files.len() == 1 {
-        &my_torrent_files[0]
-    } else {
-        my_torrent_files
-            .iter()
-            .find(|f| {
-                f.short_name == request.selected_file.clone().unwrap_or_default()
-                    || f.name == request.selected_file.clone().unwrap_or_default()
-            })
-            .ok_or(extism_pdk::Error::msg(format!(
-                "Add torrent - Unable to find file({:?}) in {:?}",
-                request.selected_file, my_torrent_files
-            )))?
-    };
-    let file_id = file.id;
+    let file = find_matching_file(&my_torrent_files, &request.selected_file)
+        .cloned()
+        .ok_or(extism_pdk::Error::msg(format!(
+            "Add torrent - Unable to find file({:?}) in {:?}",
+            request.selected_file, my_torrent_files
+        )))?;
 
-    if permanent {
-        // For permanent requests, we are done here
-        return Ok((format!("torbox://api.torbox.app/v1/api/torrents/requestdl?token=_TOKEN_&redirect=true&torrent_id={}&file_id={}", torrent_id, file_id), file.clone()));
-    }
-    // Request download link
-    let dl_req = HttpRequest {
-        url: format!("https://api.torbox.app/v1/api/torrents/requestdl?token={}&redirect=false&torrent_id={}&file_id={}", token, torrent_id, file_id),
-        headers,
-        method: Some("GET".into()),
-    };
+    Ok((torrent_id, file))
+}
 
-    let dl_res = http::request::<()>(&dl_req, None)?;
+fn get_file_download_url(
+    request: &RsRequest,
+    torrent_info: &TorrentInfo,
+    token: &str,
+    permanent: bool,
+) -> FnResult<(String, MyFile)> {
+    let files = &torrent_info.files;
 
-    if dl_res.status_code() != 200 {
-        let error_msg = String::from_utf8_lossy(&dl_res.body()).to_string();
+    if files.is_none() || files.as_ref().unwrap_or(&vec![]).is_empty() {
         return Err(WithReturnCode(
-            extism_pdk::Error::msg(format!(
-                "Request dl HTTP({}) {}: {}",
-                dl_req.url,
-                dl_res.status_code(),
-                error_msg
-            )),
-            dl_res.status_code() as i32,
+            extism_pdk::Error::msg("No files found in torrent"),
+            404,
         ));
     }
 
-    let dl_response: DownloadLinkResponse = dl_res.json().map_err(|e| {
-        WithReturnCode(
-            extism_pdk::Error::msg(format!(
-                "JSON parse error during request dl ({}): {}",
-                dl_req.url, e
-            )),
-            500,
-        )
-    })?;
+    let canonical_hash = extract_btih_hash(&request.url).and_then(|h| get_canonical_hash(&h).ok());
 
-    if let Some(err_msg) = dl_response.error {
-        return Err(WithReturnCode(extism_pdk::Error::msg(err_msg), 500));
+    // Try local cache first to skip createtorrent
+    if let Some(hash) = canonical_hash.as_deref() {
+        if let Some((cached_id, file)) = try_cached_torrent(token, hash, &request.selected_file) {
+            log!(
+                LogLevel::Info,
+                "get_file_download_url: using cached torrent_id={}",
+                cached_id
+            );
+            // Asking for a link, even for a permanent URL, tells a working torrent from a broken one
+            match request_torrent_link(token, cached_id, file.id) {
+                Ok(_) if permanent => return Ok((permanent_torrent_url(cached_id, file.id), file)),
+                Ok(link) => return Ok((link, file)),
+                Err(DownloadLinkError::Broken(detail)) => {
+                    log!(
+                        LogLevel::Warn,
+                        "Cached torrent_id={} can't be served ({}: {})",
+                        cached_id,
+                        TORBOX_BROKEN_TORRENT_ERROR,
+                        detail
+                    );
+                    remove_broken_torrent(token, cached_id, Some(hash));
+                }
+                // A permanent URL resolves its link on each read: only a broken torrent fails it now
+                Err(DownloadLinkError::Other(e)) if permanent => {
+                    log!(
+                        LogLevel::Warn,
+                        "Cache hit but requestdl failed ({:?}), keeping the permanent URL",
+                        e
+                    );
+                    return Ok((permanent_torrent_url(cached_id, file.id), file));
+                }
+                Err(DownloadLinkError::Other(e)) => {
+                    log!(
+                        LogLevel::Warn,
+                        "Cache hit but requestdl failed ({:?}), falling through to createtorrent",
+                        e
+                    );
+                }
+            }
+        }
     }
 
-    Ok((dl_response.data, file.clone()))
+    let (torrent_id, file) = add_cached_torrent(request, token, canonical_hash.as_deref())?;
+
+    let (torrent_id, file, link) = match request_torrent_link(token, torrent_id, file.id) {
+        Ok(link) => (torrent_id, file, Ok(link)),
+        Err(DownloadLinkError::Broken(detail)) => {
+            log!(
+                LogLevel::Warn,
+                "Torrent_id={} can't be served ({}: {}), adding it again",
+                torrent_id,
+                TORBOX_BROKEN_TORRENT_ERROR,
+                detail
+            );
+            remove_broken_torrent(token, torrent_id, canonical_hash.as_deref());
+            let (torrent_id, file) = add_cached_torrent(request, token, canonical_hash.as_deref())?;
+            let link = request_torrent_link(token, torrent_id, file.id);
+            (torrent_id, file, link)
+        }
+        Err(other) => (torrent_id, file, Err(other)),
+    };
+
+    match link {
+        Ok(_) if permanent => Ok((permanent_torrent_url(torrent_id, file.id), file)),
+        Ok(link) => Ok((link, file)),
+        // A permanent URL resolves its link on each read: only a broken torrent fails it now
+        Err(DownloadLinkError::Other(e)) if permanent => {
+            log!(
+                LogLevel::Warn,
+                "requestdl failed for torrent_id={} ({:?}), keeping the permanent URL",
+                torrent_id,
+                e
+            );
+            Ok((permanent_torrent_url(torrent_id, file.id), file))
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn get_usenet_file_download_url(
