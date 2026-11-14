@@ -377,11 +377,13 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
         let canonical_hash = get_canonical_hash(&raw_hash)?;
 
         // Try local cache first (avoids search_my_torrents + createtorrent API calls)
+        let mut removed_broken = false;
         if let Some((cached_id, file)) =
             try_cached_torrent(token, &canonical_hash, &request.request.selected_file)
         {
             if torrent_is_broken(token, cached_id, file.id) {
                 remove_broken_torrent(token, cached_id, Some(&canonical_hash));
+                removed_broken = true;
             } else {
                 log!(
                     LogLevel::Info,
@@ -404,9 +406,15 @@ pub fn request_permanent(Json(request): Json<RsRequestPluginRequest>) -> FnResul
             "looking for existing hash {:?}\n",
             canonical_hash
         );
-        let existing = match search_my_torrents(token, &canonical_hash, 500, None)? {
-            Some(value) => Some(value),
-            None => search_my_torrents(token, &canonical_hash, 500, Some(true))?,
+        // After deleting a broken torrent, the user's list (possibly cached by TorBox)
+        // can still show it: add the magnet again instead
+        let existing = if removed_broken {
+            None
+        } else {
+            match search_my_torrents(token, &canonical_hash, 500, None)? {
+                Some(value) => Some(value),
+                None => search_my_torrents(token, &canonical_hash, 500, Some(true))?,
+            }
         };
 
         log!(LogLevel::Debug, "In {:?}\n\n", existing);
@@ -1892,6 +1900,15 @@ fn get_file_download_url(
                         detail
                     );
                     remove_broken_torrent(token, cached_id, Some(hash));
+                }
+                // A permanent URL resolves its link on each read: only a broken torrent fails it now
+                Err(DownloadLinkError::Other(e)) if permanent => {
+                    log!(
+                        LogLevel::Warn,
+                        "Cache hit but requestdl failed ({:?}), keeping the permanent URL",
+                        e
+                    );
+                    return Ok((permanent_torrent_url(cached_id, file.id), file));
                 }
                 Err(DownloadLinkError::Other(e)) => {
                     log!(
