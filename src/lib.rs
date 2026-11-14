@@ -228,7 +228,7 @@ pub fn infos() -> FnResult<Json<PluginInformation>> {
     Ok(Json(PluginInformation {
         name: "torbox".into(),
         capabilities: vec![PluginType::Lookup, PluginType::Request],
-        version: 14,
+        version: 15,
         publisher: "neckaros".into(),
         repo: Some("https://github.com/neckaros/plugin-torbox".to_string()),
         description: "search and download torrent or usenet from Torbox".into(),
